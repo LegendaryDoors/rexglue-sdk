@@ -19,6 +19,8 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/presenter.h>
+
+#include <chrono>
 #include <rex/ui/window.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -1425,6 +1427,14 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
   return true;
 }
 
+bool Presenter::RequestUIThreadPaintFromAnyThread() {
+  if (!window_ || !surface_) {
+    return false;
+  }
+  RequestPaintOrConnectionRecoveryViaWindow(true);
+  return true;
+}
+
 void Presenter::UpdateSurfaceMonitorFromUIThread(bool old_monitor_potentially_disconnected) {
   // For dropping the monitor when the window is closing and is losing its
   // surface, the existence of `surface_` (which implies that `window_` exists
@@ -1602,6 +1612,25 @@ void Presenter::WaitForUITickFromUIThread() {
     }
     dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
   }
+#else
+  if (!AreUITicksNeededFromUIThread()) {
+    return;
+  }
+  const float refresh_rate = window_ ? window_->GetDisplayRefreshRate() : 0.0f;
+  const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(1.0 / (refresh_rate > 1.0f ? refresh_rate : 60.0f)));
+  const auto now = std::chrono::steady_clock::now();
+  const auto due = ui_tick_last_ + interval;
+  std::unique_lock<std::mutex> ui_tick_lock(ui_tick_mutex_);
+  // Guest output present requests interrupt the wait: they must not be delayed
+  // by UI pacing.
+  while (!ui_tick_force_requested_ && std::chrono::steady_clock::now() < due) {
+    ui_tick_condition_.wait_until(ui_tick_lock, due);
+  }
+  ui_tick_force_requested_ = false;
+  // Keep the cadence regular while keeping up; after a stall, restart from now
+  // rather than drawing several frames back to back.
+  ui_tick_last_ = (now > due + interval) ? now : due;
 #endif  // XE_PLATFORM
 }
 
@@ -1609,6 +1638,12 @@ void Presenter::ForceUIThreadPaintTick() {
 #if REX_PLATFORM_WIN32
   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   dxgi_ui_tick_force_requested_ = true;
+#else
+  {
+    std::scoped_lock<std::mutex> ui_tick_lock(ui_tick_mutex_);
+    ui_tick_force_requested_ = true;
+  }
+  ui_tick_condition_.notify_all();
 #endif  // XE_PLATFORM
 }
 

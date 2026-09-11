@@ -19,8 +19,25 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(
+    gpu_workaround_3d_cube_grad_sampling, true, "GPU/Shader",
+    "WORKAROUND for an NVIDIA driver bug, not guest-behaviour emulation. "
+    "Measured on 610.57.04 (RTX 5090): OpImageSampleExplicitLod with Grad "
+    "operands on 3D images is miscompiled, hard-zeroing one channel on one "
+    "lane of every 2x2 derivative quad (NCAA Football 14 tonemap 3D colour "
+    "grading LUT; the same instruction family was reported for cube images "
+    "in Forza Horizon 1). When enabled, computed-LOD 3D and cube texture "
+    "fetches are sampled with an explicitly computed LOD (OpImageQueryLod "
+    "plus the guest LOD bias) instead of Grad operands. Mip selection is "
+    "mathematically identical and Vulkan applies no anisotropic filtering "
+    "to 3D/cube sampling, so this is semantically safe on all drivers. 2D "
+    "and stacked-2D fetches keep Grad operands (measured unaffected: "
+    "REX_TFETCH_FORCE_LOD0=2d left the defect unchanged). Disable only to "
+    "reproduce the driver bug.");
 
 namespace rex::graphics {
 
@@ -1620,6 +1637,33 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         if (!use_computed_lod) {
           texture_parameters.lod = lod;
         }
+        // Diagnostic, NOT a fix: REX_TFETCH_FORCE_LOD0=3d|2d|all replaces Grad
+        // image operands with Lod 0. Changes filtering; never on by default.
+        bool diag_forced_lod0 = false;
+        {
+          static const char* tfetch_force_lod0_env = getenv("REX_TFETCH_FORCE_LOD0");
+          if (tfetch_force_lod0_env && use_computed_lod) {
+            bool dimension_is_3d_or_cube =
+                instr.dimension == xenos::FetchOpDimension::k3DOrStacked ||
+                instr.dimension == xenos::FetchOpDimension::kCube;
+            bool force_lod0 =
+                !strcmp(tfetch_force_lod0_env, "all") ||
+                (!strcmp(tfetch_force_lod0_env, "3d") && dimension_is_3d_or_cube) ||
+                (!strcmp(tfetch_force_lod0_env, "2d") && !dimension_is_3d_or_cube);
+            if (force_lod0) {
+              image_operands_mask = spv::ImageOperandsLodMask;
+              texture_parameters.lod = builder_->makeFloatConstant(0.0f);
+              diag_forced_lod0 = true;
+            }
+          }
+        }
+        // Driver-bug workaround (gpu_workaround_3d_cube_grad_sampling): for 3D
+        // and cube fetches, use OpImageQueryLod and an explicit Lod, not Grad.
+        bool grad_replaced_with_query_lod =
+            use_computed_lod && !instr.attributes.use_register_gradients && !diag_forced_lod0 &&
+            (instr.dimension == xenos::FetchOpDimension::k3DOrStacked ||
+             instr.dimension == xenos::FetchOpDimension::kCube) &&
+            REXCVAR_GET(gpu_workaround_3d_cube_grad_sampling);
         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
           // 3D (3 coordinate components, 3 gradient components, single fetch)
           // or 2D stacked (2 coordinate components + 1 array layer coordinate
@@ -1627,22 +1671,37 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           // linear-filtered).
 
           assert_true(data_is_3d != spv::NoResult);
+          id_vector_temp_.clear();
+          for (uint32_t i = 0; i < 3; ++i) {
+            id_vector_temp_.push_back(coordinates[i]);
+          }
+          spv::Id coordinates_3d = builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+          spv::Id query_lod_3d = spv::NoResult;
+          if (grad_replaced_with_query_lod) {
+            // Query the LOD before the 3D-vs-stacked branch so the implicit
+            // derivatives of OpImageQueryLod are in uniform control flow.
+            texture_parameters.coords = coordinates_3d;
+            query_lod_3d = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_,
+                QueryTextureLod(texture_parameters, image_3d_unsigned, image_3d_signed, sampler,
+                                is_all_signed),
+                lod);
+          }
           SpirvBuilder::IfBuilder if_data_is_3d(data_is_3d, spv::SelectionControlDontFlattenMask,
                                                 *builder_);
           spv::Id sample_result_unsigned_3d, sample_result_signed_3d;
           {
             // 3D.
-            if (use_computed_lod) {
+            spv::ImageOperandsMask image_operands_mask_3d = image_operands_mask;
+            if (grad_replaced_with_query_lod) {
+              texture_parameters.lod = query_lod_3d;
+              image_operands_mask_3d = spv::ImageOperandsLodMask;
+            } else if (use_computed_lod) {
               texture_parameters.gradX = gradients_h;
               texture_parameters.gradY = gradients_v;
             }
-            id_vector_temp_.clear();
-            for (uint32_t i = 0; i < 3; ++i) {
-              id_vector_temp_.push_back(coordinates[i]);
-            }
-            texture_parameters.coords =
-                builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
-            SampleTexture(texture_parameters, image_operands_mask, image_3d_unsigned,
+            texture_parameters.coords = coordinates_3d;
+            SampleTexture(texture_parameters, image_operands_mask_3d, image_3d_unsigned,
                           image_3d_signed, sampler, is_any_unsigned, is_any_signed,
                           sample_result_unsigned_3d, sample_result_signed_3d);
           }
@@ -1650,6 +1709,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           spv::Id sample_result_unsigned_stacked, sample_result_signed_stacked;
           {
             // 2D stacked.
+            if (grad_replaced_with_query_lod) {
+              // The workaround replaces Grad only for the true 3D case; Grad
+              // preserves anisotropic filtering for stacked textures.
+              texture_parameters.lod = spv::NoResult;
+            }
             if (use_computed_lod) {
               // Extract 2D gradients for stacked textures which are 2D arrays.
               uint_vector_temp_.clear();
@@ -1837,19 +1901,31 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
-            texture_parameters.gradX = gradients_h;
-            texture_parameters.gradY = gradients_v;
-          }
           id_vector_temp_.clear();
           for (uint32_t i = 0; i < 3; ++i) {
             id_vector_temp_.push_back(coordinates[i]);
           }
           texture_parameters.coords =
               builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
-          SampleTexture(texture_parameters, image_operands_mask, image_2d_array_or_cube_unsigned,
-                        image_2d_array_or_cube_signed, sampler, is_any_unsigned, is_any_signed,
-                        sample_result_unsigned, sample_result_signed);
+          spv::ImageOperandsMask image_operands_mask_call = image_operands_mask;
+          if (grad_replaced_with_query_lod) {
+            // kCube part of the workaround: the queried LOD sees the same cube
+            // direction vector, and cube sampling has no anisotropy to lose.
+            assert_true(instr.dimension == xenos::FetchOpDimension::kCube);
+            texture_parameters.lod = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_,
+                QueryTextureLod(texture_parameters, image_2d_array_or_cube_unsigned,
+                                image_2d_array_or_cube_signed, sampler, is_all_signed),
+                lod);
+            image_operands_mask_call = spv::ImageOperandsLodMask;
+          } else if (use_computed_lod) {
+            texture_parameters.gradX = gradients_h;
+            texture_parameters.gradY = gradients_v;
+          }
+          SampleTexture(texture_parameters, image_operands_mask_call,
+                        image_2d_array_or_cube_unsigned, image_2d_array_or_cube_signed, sampler,
+                        is_any_unsigned, is_any_signed, sample_result_unsigned,
+                        sample_result_signed);
         }
 
         // Swizzle the result components manually if needed, to `result`.
@@ -2029,11 +2105,23 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
-        // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // Result exponent bias from bits 13:18 of fetch constant word 3
+        // (dword_3.exp_adjust in xenos.h), as in the DXBC translator.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_fetch_constants_,
+                                                             id_vector_temp_),
+                                 spv::NoPrecision));
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;

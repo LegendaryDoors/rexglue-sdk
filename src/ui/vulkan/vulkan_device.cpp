@@ -234,6 +234,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_custom_border_color)
       // Required for true null descriptors in bindless texture bindings.
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_robustness2)
+      // Diagnostics: turns VK_ERROR_DEVICE_LOST into a report of the faulting
+      // address ranges rather than a guess. #342.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_device_fault)
+      // Diagnostics: checkpoint markers readable after a device loss. #207.
+      XE_UI_VULKAN_STRUCT_EXTENSION(NV_device_diagnostic_checkpoints)
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       // #237.
@@ -333,6 +338,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDeviceFaultFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT>
+      features_EXT_device_fault;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -373,6 +381,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_device_fault) {
+      features_EXT_device_fault.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -659,6 +670,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_3, shaderDemoteToHelperInvocation);
       XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
+      // robustBufferAccess does not cover image accesses, and guest-derived
+      // image coordinates and mip levels cannot be trusted either.
+      XE_UI_VULKAN_FEATURE_2(features_1_3, robustImageAccess);
     }
   } else {
     if (ext_1_3_KHR_dynamic_rendering) {
@@ -727,6 +741,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
     }
+  }
+
+  if (device->extensions_.ext_EXT_device_fault) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_device_fault, deviceFault)
+    XE_UI_VULKAN_FEATURE_2(features_EXT_device_fault, deviceFaultVendorBinary)
   }
 
 #undef XE_UI_VULKAN_LIMIT
@@ -799,6 +818,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+  }
+  if (device->extensions_.ext_EXT_device_fault) {
+#include <rex/ui/vulkan/functions/device_ext_device_fault.inc>
+  }
+  if (device->extensions_.ext_NV_device_diagnostic_checkpoints) {
+#include <rex/ui/vulkan/functions/device_nv_diagnostic_checkpoints.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

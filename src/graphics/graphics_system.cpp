@@ -76,6 +76,10 @@ __declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
 }  // extern "C"
 #endif  // REX_PLATFORM_WIN32
 
+uint64_t GraphicsSystem::swap_count() const {
+  return command_processor_ ? command_processor_->swap_count() : 0;
+}
+
 GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
 
 GraphicsSystem::~GraphicsSystem() = default;
@@ -383,6 +387,10 @@ void GraphicsSystem::BeginTracing() {
 
 void GraphicsSystem::EndTracing() {
   command_processor_->EndTracing();
+}
+
+bool GraphicsSystem::is_tracing() const {
+  return command_processor_ && command_processor_->is_streaming_trace();
 }
 
 void GraphicsSystem::Pause() {

@@ -215,7 +215,11 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   Entry* parent_entry = nullptr;
   Entry* entry = nullptr;
 
-  auto base_path = rex::string::utf8_find_base_guest_path(path);
+  // The NT object namespace resolves '.' and '..' before the filesystem sees
+  // them, and titles do open directories as "dir\.".
+  auto canonical_path = rex::string::utf8_canonicalize_guest_path(path);
+
+  auto base_path = rex::string::utf8_find_base_guest_path(canonical_path);
   if (!base_path.empty()) {
     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
@@ -223,10 +227,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       return X_STATUS_NO_SUCH_FILE;
     }
 
-    auto file_name = rex::string::utf8_find_name_from_guest_path(path);
+    auto file_name = rex::string::utf8_find_name_from_guest_path(canonical_path);
     entry = parent_entry->GetChild(file_name);
   } else {
-    entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
+    entry = !root_entry ? ResolvePath(canonical_path) : root_entry->GetChild(canonical_path);
   }
 
   if (entry) {
@@ -319,7 +323,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   }
   if (!entry) {
     // Create if needed (either new or as a replacement).
-    entry = CreatePath(path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
+    entry = CreatePath(canonical_path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
     if (!entry) {
       return X_STATUS_ACCESS_DENIED;
     }

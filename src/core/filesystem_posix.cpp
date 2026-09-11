@@ -170,25 +170,15 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
                                                      bool /*allow_share_delete*/) {
   // POSIX allows unlinking/replacing an open file, so there is no share-delete
   // analog to thread through here.
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access |= O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
-  }
+  // O_RDONLY, O_WRONLY and O_RDWR are an enumeration, not bits: a handle
+  // opened for read and write must be O_RDWR or every read on it fails.
+  const bool wants_read =
+      desired_access & (FileAccess::kGenericRead | FileAccess::kGenericExecute |
+                        FileAccess::kGenericAll | FileAccess::kFileReadData);
+  const bool wants_write =
+      desired_access & (FileAccess::kGenericWrite | FileAccess::kGenericAll |
+                        FileAccess::kFileWriteData | FileAccess::kFileAppendData);
+  int open_access = wants_read && wants_write ? O_RDWR : wants_write ? O_WRONLY : O_RDONLY;
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= O_APPEND;
   }

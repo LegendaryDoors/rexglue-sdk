@@ -27,6 +27,9 @@ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchr
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(async_event_);
+  if (file_ && file_->entry()) {
+    file_->entry()->AddOpenHandle();
+  }
 }
 
 XFile::XFile() : XObject(kObjectType) {
@@ -37,7 +40,15 @@ XFile::XFile() : XObject(kObjectType) {
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
-  file_->Destroy();
+  rex::filesystem::Entry* entry = file_ ? file_->entry() : nullptr;
+  if (file_) {
+    file_->Destroy();
+  }
+  // The entry outlives the file object; it is owned by its parent. A file the
+  // guest marked for deletion goes when its last handle closes.
+  if (entry && entry->ReleaseOpenHandle() == 0 && entry->delete_on_close()) {
+    entry->Delete();
+  }
 }
 
 uint64_t XFile::position() const {

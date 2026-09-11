@@ -42,6 +42,10 @@ class TraceDump {
   GraphicsSystem* graphics_system_ = nullptr;
   std::unique_ptr<TracePlayer> player_;
 
+  // Mid-frame stop dumps. REX_DUMP_REGISTERS=<path> writes the registers;
+  // REX_DUMP_GUEST_MEMORY=<hex addr>,<hex len>,<path>[;...] writes memory.
+  void DumpStopState(int stop);
+
  private:
   bool Setup();
   bool Load(const std::filesystem::path& trace_file_path);

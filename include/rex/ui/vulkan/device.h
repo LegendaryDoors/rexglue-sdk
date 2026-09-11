@@ -95,6 +95,9 @@ class VulkanDevice {
     VkDeviceSize nonCoherentAtomSize = 256;
 
     bool robustBufferAccess = false;
+    // Vulkan 1.3 core (also VK_EXT_image_robustness). robustBufferAccess does
+    // not cover image accesses: an out-of-range texel fetch can fault the GPU.
+    bool robustImageAccess = false;
     bool fullDrawIndexUint32 = false;
     bool independentBlend = false;
     bool geometryShader = false;
@@ -168,6 +171,11 @@ class VulkanDevice {
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
+
+    // VK_EXT_device_fault
+
+    bool deviceFault = false;
+    bool deviceFaultVendorBinary = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -195,6 +203,12 @@ class VulkanDevice {
     bool ext_EXT_custom_border_color = false;
     // Has optional features not implied by this being true.
     bool ext_EXT_robustness2 = false;
+    // Diagnostics only. Turns VK_ERROR_DEVICE_LOST into a report of the
+    // faulting address ranges and their access type.
+    bool ext_EXT_device_fault = false;
+    // Diagnostics only. Checkpoint markers survive a device loss, so they can
+    // identify the last command the GPU actually reached.
+    bool ext_NV_device_diagnostic_checkpoints = false;
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
@@ -220,6 +234,10 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
+    // VK_EXT_device_fault (#342)
+#include <rex/ui/vulkan/functions/device_ext_device_fault.inc>
+    // VK_NV_device_diagnostic_checkpoints (#207)
+#include <rex/ui/vulkan/functions/device_nv_diagnostic_checkpoints.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

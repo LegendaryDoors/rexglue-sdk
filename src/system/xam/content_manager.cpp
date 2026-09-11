@@ -570,6 +570,18 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
 }
 
 X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
+  return InstallContent(package_path, kernel_state_->title_id());
+}
+
+X_RESULT ContentManager::InstallPackage(const std::filesystem::path& content_root,
+                                        uint32_t title_id,
+                                        const std::filesystem::path& package_path) {
+  ContentManager manager(nullptr, content_root);
+  return manager.InstallContent(package_path, title_id);
+}
+
+X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path,
+                                        uint32_t title_id) {
   if (!std::filesystem::exists(package_path)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
@@ -587,7 +599,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
   XCONTENT_AGGREGATE_DATA content_data;
   content_data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
   content_data.content_type = XContentType::kMarketplaceContent;
-  content_data.title_id = kernel_state_->title_id();
+  content_data.title_id = title_id;
   content_data.xuid = 0;
   content_data.set_file_name(file_name);
 

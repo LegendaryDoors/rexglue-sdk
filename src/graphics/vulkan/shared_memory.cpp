@@ -19,6 +19,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/diagnostic_gate.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
@@ -284,11 +285,31 @@ void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
   void* download_mapping;
   if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
                       &download_mapping) == VK_SUCCESS) {
+    // REX_DUMP_SHARED_MEMORY=<path> writes every GPU-written guest memory
+    // range as [u32 guest_address][u32 size][payload] records.
+    FILE* shared_memory_dump_file = nullptr;
+    if (const char* shared_memory_dump_path = getenv("REX_DUMP_SHARED_MEMORY")) {
+      shared_memory_dump_file = fopen(shared_memory_dump_path, "wb");
+      if (!shared_memory_dump_file) {
+        REXGPU_ERROR("REX_DUMP_SHARED_MEMORY: cannot open {} for writing", shared_memory_dump_path);
+      }
+    }
     uint32_t download_buffer_offset = 0;
     for (const auto& download_range : trace_download_ranges()) {
-      trace_writer_.WriteMemoryRead(
-          download_range.first, download_range.second,
-          reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset);
+      const uint8_t* download_range_data =
+          reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset;
+      trace_writer_.WriteMemoryRead(download_range.first, download_range.second,
+                                    download_range_data);
+      if (shared_memory_dump_file) {
+        fwrite(&download_range.first, sizeof(uint32_t), 1, shared_memory_dump_file);
+        fwrite(&download_range.second, sizeof(uint32_t), 1, shared_memory_dump_file);
+        fwrite(download_range_data, 1, download_range.second, shared_memory_dump_file);
+      }
+      download_buffer_offset += download_range.second;
+    }
+    if (shared_memory_dump_file) {
+      fclose(shared_memory_dump_file);
+      REXGPU_INFO("REX_DUMP_SHARED_MEMORY: wrote {} range(s)", trace_download_ranges().size());
     }
     dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
   } else {
@@ -363,6 +384,11 @@ bool VulkanSharedMemory::UploadRanges(
     uint32_t upload_range_length = upload_range.second;
     trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
                                   upload_range_length << page_size_log2());
+    if (diag::RangeCoversLoggedTexture(upload_range_start << page_size_log2(),
+                                       upload_range_length << page_size_log2())) {
+      REXGPU_INFO("TEXWATCHED upload {:08X}+{:X}", upload_range_start << page_size_log2(),
+                  upload_range_length << page_size_log2());
+    }
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
@@ -378,6 +404,9 @@ bool VulkanSharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      RecordUploadedPages(upload_range_start << page_size_log2(),
+                          memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                          uint32_t(upload_buffer_size));
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,

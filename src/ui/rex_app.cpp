@@ -11,6 +11,8 @@
 
 #include <rex/rex_app.h>
 
+#include <chrono>
+#include <memory>
 #include <cstdlib>
 
 #include <rex/assert.h>
@@ -33,6 +35,7 @@
 #include <rex/system/achievement_manager.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/screenshot.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
@@ -49,6 +52,9 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(debug_overlay, false, "UI",
+                    "Show the debug overlay (F3) from the start, for captures and scripted runs");
 
 namespace rex {
 
@@ -104,6 +110,14 @@ bool ReXApp::OnInitialize() {
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
+  // The config file supplies defaults for the path cvars read below, so it must
+  // be applied first. Command-line values still win over it.
+  std::filesystem::path config_path = exe_dir / (std::string(GetName()) + ".toml");
+  if (!std::filesystem::exists(config_path)) {
+    config_path = rex::filesystem::GetUserFolder() / GetName() / (std::string(GetName()) + ".toml");
+  }
+  config_loaded_ = std::filesystem::exists(config_path) && rex::cvar::LoadConfig(config_path);
+
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
   if (!game_data_cvar.empty()) {
@@ -141,8 +155,7 @@ bool ReXApp::SetupEnvironment() {
     metadata_dir = metadata_root_cvar;
   }
 
-  PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+  PathConfig path_config{game_dir, user_dir, update_dir, cache_dir, metadata_dir, config_path};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -151,10 +164,6 @@ bool ReXApp::SetupEnvironment() {
   metadata_root_ = path_config.metadata_root;
   config_path_ = path_config.config_path;
   resolved_defaults_ = std::move(path_config);
-
-  // Load config FIRST so log cvars have final values
-  if (std::filesystem::exists(config_path_))
-    rex::cvar::LoadConfig(config_path_);
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
@@ -167,7 +176,9 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    // Under user_data_root_: a packaged executable sits on read-only
+    // storage, where a logs folder beside it cannot be created.
+    log_config.log_dir = (user_data_root_ / "logs").string();
   }
 
   rex::InitLogging(log_config);
@@ -178,8 +189,13 @@ bool ReXApp::SetupEnvironment() {
 
   OnPostInitLogging();
 
-  if (std::filesystem::exists(config_path_))
-    REXLOG_INFO("Loaded config: {}", config_path_.filename().string());
+  // The parse result is logged again here, after the file sink exists: the
+  // reader runs before it, and its own message can be lost.
+  if (config_loaded_) {
+    REXLOG_INFO("Loaded config: {}", config_path_.string());
+  } else if (std::filesystem::exists(config_path_)) {
+    REXLOG_ERROR("Config {} exists but could not be read; defaults in use", config_path_.string());
+  }
 
   REXLOG_INFO("{} starting", GetName());
   if (!game_data_root_.empty()) {
@@ -364,6 +380,9 @@ bool ReXApp::SetupPresentation() {
       }
     }
     window_->SetPresenter(presenter);
+    // Window captures (--screenshot_host_at) need only the presenter, which
+    // exists before the runtime.
+    rex::system::StartHostScreenshotScheduler(presenter);
   } else if (!graphics_system) {
     // Detached mode: the app brings its own renderer and drives its own paint
     // loop. ReXApp owns the returned drawer via immediate_drawer_.
@@ -393,6 +412,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
     }
   });
+  if (REXCVAR_GET(debug_overlay)) {
+    debug_overlay_ =
+        std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+  }
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
       console_overlay_.reset();
@@ -407,7 +430,30 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
   });
-  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+  // Streams every GPU command from the next primary buffer until the key is
+  // pressed again, into --trace_gpu_prefix.
+  rex::ui::RegisterBind("bind_trace_stream", "F8", "Start/stop a GPU stream trace", [this] {
+    auto* graphics_system = runtime_ ? runtime_->graphics_system() : nullptr;
+    if (!graphics_system) {
+      REXLOG_WARN("Stream trace: no graphics system; ignored");
+      return;
+    }
+    if (graphics_system->is_tracing()) {
+      REXLOG_INFO("Stream trace: stopping; the file closes after the next swap");
+      graphics_system->EndTracing();
+      return;
+    }
+    const std::string trace_prefix = REXCVAR_QUERY(std::string, trace_gpu_prefix);
+    if (trace_prefix.empty()) {
+      REXLOG_WARN("Stream trace: --trace_gpu_prefix=<dir> is not set; ignored");
+      return;
+    }
+    REXLOG_INFO("Stream trace: starting into '{}'", trace_prefix);
+    graphics_system->BeginTracing();
+  });
+  // F7 is the screenshot hotkey and F8 the stream trace, so the achievements
+  // overlay sits on F9. Rebindable via the bind_achievements cvar.
+  rex::ui::RegisterBind("bind_achievements", "F9", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
     } else {
@@ -448,6 +494,33 @@ void ReXApp::LaunchModule() {
     }
 
     auto* graphics_system = runtime_->graphics_system();
+    if (graphics_system) {
+      // The overlay's guest frame rate: swaps per second over the last half
+      // second. The runtime is looked up per call, as it outlives no overlay.
+      struct Rate {
+        std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+        uint64_t swaps = 0;
+        double fps = 0;
+      };
+      auto rate = std::make_shared<Rate>();
+      SetGuestFrameStats([this, rate]() {
+        ui::FrameStats stats;
+        auto* gs = runtime_ ? runtime_->graphics_system() : nullptr;
+        if (!gs) return stats;
+        const uint64_t swaps = gs->swap_count();
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - rate->at).count();
+        if (elapsed >= 0.5) {
+          rate->fps = static_cast<double>(swaps - rate->swaps) / elapsed;
+          rate->swaps = swaps;
+          rate->at = now;
+        }
+        stats.frame_count = swaps;
+        stats.fps = rate->fps;
+        stats.frame_time_ms = rate->fps > 0 ? 1000.0 / rate->fps : 0.0;
+        return stats;
+      });
+    }
     if (graphics_system && !runtime_->cache_root().empty()) {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
@@ -483,6 +556,32 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+  // F4: capture one self-contained GPU frame trace into --trace_gpu_prefix.
+  // Ignored when no directory is configured.
+  if (e.virtual_key() == ui::VirtualKey::kF4) {
+    // trace_gpu_prefix is defined in the GPU plugin, which is built with hidden
+    // visibility, so go through the cvar registry by name.
+    const std::string trace_prefix = REXCVAR_QUERY(std::string, trace_gpu_prefix);
+    auto* graphics_system = runtime_ ? runtime_->graphics_system() : nullptr;
+    if (!graphics_system) {
+      REXLOG_WARN("F4: no graphics system; frame trace ignored");
+    } else if (trace_prefix.empty()) {
+      REXLOG_WARN("F4: --trace_gpu_prefix=<dir> is not set; frame trace ignored");
+    } else {
+      REXLOG_INFO("F4: requesting a single-frame GPU trace into '{}'", trace_prefix);
+      graphics_system->RequestFrameTrace();
+    }
+    e.set_handled(true);
+    return;
+  }
+  // F7: write the latest presented guest frame to a PNG in --screenshot_dir,
+  // logging its timestamp on the input timeline.
+  if (e.virtual_key() == ui::VirtualKey::kF7) {
+    rex::system::CaptureScreenshot(runtime_ ? runtime_->graphics_system() : nullptr, std::nullopt,
+                                   "F7");
+    e.set_handled(true);
+    return;
+  }
   rex::ui::ProcessKeyEvent(e);
 }
 
@@ -547,6 +646,10 @@ void ReXApp::OnRestored(ui::UIEvent& e) {
 void ReXApp::OnDestroy() {
   // Notify subclass before cleanup
   OnShutdown();
+
+  // The host capture thread asks the window to paint; join it before the UI
+  // starts coming apart.
+  rex::system::StopHostScreenshotScheduler();
 
   // Unregister overlay keybinds before destroying dialogs
   rex::ui::UnregisterBind("bind_debug_overlay");

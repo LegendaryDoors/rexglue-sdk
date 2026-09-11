@@ -12,10 +12,12 @@
 #include <algorithm>
 #include <cmath>
 
+#include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
+#include <rex/input/input_timeline.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
@@ -26,6 +28,11 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+
+// Defined in input_playback.cpp.
+REXCVAR_DECLARE(std::string, input_script);
+REXCVAR_DECLARE(std::string, input_record);
+
 namespace rex::input {
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
@@ -33,6 +40,24 @@ InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 InputSystem::~InputSystem() = default;
 
 X_STATUS InputSystem::Setup() {
+  // Timeline input replay/record, here rather than in ReXApp so every app with
+  // an InputSystem gets it. A bad script or record path is fatal.
+  const std::string& script_path = REXCVAR_GET(input_script);
+  if (!script_path.empty()) {
+    replayer_ = InputReplayer::FromFile(script_path);
+    if (!replayer_) {
+      rex::FatalError("--input_script: failed to load '" + script_path +
+                      "' (see log for the line-level reason)");
+    }
+  }
+  const std::string& record_path = REXCVAR_GET(input_record);
+  if (!record_path.empty()) {
+    recorder_ = InputRecorder::ToFile(record_path);
+    if (!recorder_) {
+      rex::FatalError("--input_record: cannot open '" + record_path +
+                      "' for writing");
+    }
+  }
   return X_STATUS_SUCCESS;
 }
 
@@ -77,6 +102,12 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
 
+  // t0 of the process-wide input timeline: the guest's first user-0 poll.
+  // Marked before any early return, so every timestamped feature shares it.
+  if (user_index == 0) {
+    InputTimeline::MarkStarted();
+  }
+
   bool any_connected = false;
   bool first_result = true;
   X_INPUT_STATE merged = {};
@@ -116,8 +147,23 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     }
   }
 
+  // Timeline replay (--input_script): merge scripted state into what the
+  // drivers produced. User 0 only, and applied even for state-less polls.
+  if (replayer_ && user_index == 0) {
+    replayer_->Apply(&merged);
+    // A loaded script implies a connected controller even if no physical
+    // driver reported one.
+    first_result = false;
+  }
+
   if (first_result) {
     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  // Timeline record (--input_record): pure observer of what the guest
+  // actually receives (post-merge, post-replay).
+  if (recorder_ && user_index == 0 && out_state) {
+    recorder_->Observe(merged);
   }
 
   if (out_state) {

@@ -23,6 +23,10 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+
 namespace rex::runtime {
 
 namespace {
@@ -32,9 +36,40 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
   return runtime ? runtime->function_dispatcher() : nullptr;
 }
 
+//=============================================================================
+// REX_SURVEY_INVALID_FUNCTIONS: DIAGNOSTIC, NOT A FIX. Off unless set.
+//=============================================================================
+// An unregistered call logs its address and returns instead of aborting, so a
+// single boot enumerates every missing function. Execution is then incorrect.
+bool SurveyInvalidFunctions() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("REX_SURVEY_INVALID_FUNCTIONS");
+    return v && *v != '\0' && *v != '0';
+  }();
+  return enabled;
+}
+
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+  if (SurveyInvalidFunctions()) [[unlikely]] {
+    const uint32_t address = ctx.last_indirect_target;
+    static std::mutex mutex;
+    static std::unordered_set<uint32_t> seen;
+    bool first_time;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      first_time = seen.insert(address).second;
+    }
+    if (first_time) {
+      REXCPU_ERROR(
+          "SURVEY: unregistered function 0x{:08X} - returning instead of aborting. "
+          "Execution is now INCORRECT; this run is for collecting addresses only.",
+          address);
+    }
+    return;
+  }
+
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
             ctx.last_indirect_target);
 }
@@ -125,6 +160,18 @@ uint64_t FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address
     return 0xDEADBABE;
   }
   return ctx->r3.u64;
+}
+
+uint64_t FunctionDispatcher::ExecuteTrap(ThreadState* thread_state, uint32_t address,
+                                         uint64_t args[], size_t arg_count) {
+  auto* ctx = thread_state->context();
+  PPCContext saved = *ctx;
+
+  uint64_t result = Execute(thread_state, address, args, arg_count);
+
+  *ctx = saved;
+  ctx->fpscr.restoreGuestBits(saved.fpscr.csr);
+  return result;
 }
 
 uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_t address,

@@ -79,6 +79,20 @@ class IGraphicsSystem {
     (void)blocking;
   }
 
+  // Captures one self-contained frame trace at the next swap into the
+  // trace_gpu_prefix directory. Each file replays standalone. Default: no-op.
+  virtual void RequestFrameTrace() {}
+
+  // Streams every GPU command into the trace_gpu_prefix directory from the
+  // next primary buffer until EndTracing. Default: no-op, never tracing.
+  virtual void BeginTracing() {}
+  virtual void EndTracing() {}
+  virtual bool is_tracing() const { return false; }
+
+  // Guest frames presented so far: the counter behind the debug overlay's
+  // frame rate.
+  virtual uint64_t swap_count() const { return 0; }
+
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
                  ui::WindowedAppContext* app_context, bool with_presentation) {

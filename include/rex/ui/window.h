@@ -212,6 +212,8 @@ class Window {
   // the On* functions are for the implementation's feedback).
 
   virtual uint32_t GetMediumDpi() const { return 96; }
+  // Refresh rate of the display the window is on, in Hz, or 0 if unknown.
+  virtual float GetDisplayRefreshRate() const { return 0.0f; }
   uint32_t GetDpi() const {
     uint32_t dpi = GetLatestDpiImpl();
     return dpi ? dpi : GetMediumDpi();

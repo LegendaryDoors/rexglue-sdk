@@ -96,6 +96,9 @@ class TraceReader {
   const Frame* frame(int n) const { return &frames_[n]; }
   int frame_count() const { return int(frames_.size()); }
 
+  // Decodes a recorded memory payload into out (decoded_length bytes).
+  bool DecodeMemory(const MemoryCommand* command, std::vector<uint8_t>& out);
+
   bool Open(const std::string_view path);
 
   void Close();

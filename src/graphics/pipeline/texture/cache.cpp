@@ -11,12 +11,16 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/graphics/diagnostic_gate.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -224,6 +228,11 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
 TextureCache::~TextureCache() {
   DestroyAllTextures(true);
 
+  if (diag::VerifyTextures()) {
+    REXGPU_INFO("REX_VERIFY_TEXTURES: textures checked={} stale={}", verify_textures_checked_,
+                verify_textures_stale_);
+  }
+
   if (scaled_resolve_global_watch_handle_) {
     shared_memory().UnregisterGlobalWatch(scaled_resolve_global_watch_handle_);
   }
@@ -314,7 +323,8 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                       bool shared_memory_holds_copy) {
   if (length_unscaled == 0) {
     return;
   }
@@ -341,8 +351,13 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   }
 
   // Invalidate textures. Toggling individual textures between scaled and
-  // unscaled also relies on invalidation through shared memory.
-  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+  // unscaled also relies on invalidation through shared memory. A resolve at
+  // draw resolution scale leaves the shared memory copy outdated, not valid.
+  if (IsDrawResolutionScaled() && !shared_memory_holds_copy) {
+    shared_memory().RangeWrittenByGpuOutsideBuffer(start_unscaled, length_unscaled);
+  } else {
+    shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+  }
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
@@ -389,6 +404,10 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   pending_load_out.load_base = base_outdated;
   pending_load_out.load_mips = mips_outdated;
   pending_range_count_out = 0;
+  if (diag::LoggedTextureBase() == (uint32_t(texture.key().base_page) << 12)) {
+    REXGPU_INFO("TEXWATCHED load scheduled base={:08X} load_base={} load_mips={}",
+                uint32_t(texture.key().base_page) << 12, base_outdated, mips_outdated);
+  }
 
   TextureKey texture_key = texture.key();
   if (base_outdated) {
@@ -440,10 +459,144 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // resolves as well to detect when the CPU wants to reuse the memory for a
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
-  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  // A CPU write landing between the upload snapshot and the watch cannot mark
+  // the texture outdated, so keep the subresource outdated instead.
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    bool base_stale = pending_load.load_base &&
+                      shared_memory().CountOutdatedPages(texture_key.base_page << 12,
+                                                         texture.GetGuestBaseSize()) != 0;
+    bool mips_stale = pending_load.load_mips &&
+                      shared_memory().CountOutdatedPages(texture_key.mip_page << 12,
+                                                         texture.GetGuestMipsSize()) != 0;
+    if (diag::LoggedTextureBase() == (uint32_t(texture_key.base_page) << 12)) {
+      REXGPU_INFO("TEXWATCHED committed base={:08X} loaded_base={} loaded_mips={} stale_base={} "
+                  "stale_mips={}",
+                  uint32_t(texture_key.base_page) << 12, pending_load.load_base,
+                  pending_load.load_mips, base_stale, mips_stale);
+    }
+    texture.MakeUpToDateAndWatch(global_lock, pending_load.load_base && !base_stale,
+                                 pending_load.load_mips && !mips_stale);
+    if (diag::VerifyTextures()) {
+      RecordVerificationHashes(global_lock, texture, pending_load.load_base && !base_stale,
+                               pending_load.load_mips && !mips_stale);
+    }
+    if (base_stale || mips_stale) {
+      // Without this, a binding that stays in sync would never re-examine the
+      // still-outdated texture and the stale copy would persist indefinitely.
+      texture_became_outdated_.store(true, std::memory_order_release);
+      // DIAGNOSTIC (REX_DIAG_STALE_TEXTURE_COMMIT=1): log each deferred
+      // commit. Costs nothing when the variable is unset.
+      static const bool diag_stale_commit = [] {
+        const char* value = std::getenv("REX_DIAG_STALE_TEXTURE_COMMIT");
+        return value && value[0] && value[0] != '0';
+      }();
+      if (diag_stale_commit) {
+        REXGPU_WARN(
+            "[diag-stale-commit] {}x{} {} texture, base 0x{:08X} (size 0x{:X}), mips 0x{:08X}: "
+            "{}{}{} rewritten between the upload snapshot and commit - kept outdated for reload "
+            "on the next draw",
+            texture_key.GetWidth(), texture_key.GetHeight(),
+            FormatInfo::Get(texture_key.format)->name, texture_key.base_page << 12,
+            texture.GetGuestBaseSize(), texture_key.mip_page << 12, base_stale ? "base" : "",
+            (base_stale && mips_stale) ? " and " : "", mips_stale ? "mips" : "");
+      }
+    }
+  }
   texture.LogAction("Loaded");
 
   return true;
+}
+
+void TextureCache::RecordVerificationHashes(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, Texture& texture,
+    bool base, bool mips) {
+  Texture::VerificationState& state = texture.verification();
+  const TextureKey& key = texture.key();
+  if (base) {
+    state.base_hash = shared_memory().HashGuestRangeCpuPages(
+        key.base_page << 12, texture.GetGuestBaseSize(), &state.base_gpu_written_pages);
+    state.base_loaded_submission = current_submission_index_;
+    state.base_known = true;
+    state.base_reported = false;
+  }
+  if (mips) {
+    state.mips_hash = shared_memory().HashGuestRangeCpuPages(
+        key.mip_page << 12, texture.GetGuestMipsSize(), &state.mips_gpu_written_pages);
+    state.mips_loaded_submission = current_submission_index_;
+    state.mips_known = true;
+    state.mips_reported = false;
+  }
+}
+
+void TextureCache::VerifyBoundTextures(uint32_t used_texture_mask) {
+  uint32_t index;
+  while (rex::bit_scan_forward(used_texture_mask, &index)) {
+    used_texture_mask &= ~(UINT32_C(1) << index);
+    const TextureBinding& binding = texture_bindings_[index];
+    if (!binding.key.is_valid) {
+      continue;
+    }
+    if (binding.texture) {
+      VerifyTexture(*binding.texture, index);
+    }
+    if (binding.texture_signed) {
+      VerifyTexture(*binding.texture_signed, index);
+    }
+  }
+}
+
+void TextureCache::VerifyTexture(Texture& texture, uint32_t fetch_constant_index) {
+  const TextureKey& key = texture.key();
+  if (key.scaled_resolve) {
+    return;
+  }
+  Texture::VerificationState& state = texture.verification();
+  if (state.last_checked_submission == current_submission_index_) {
+    return;
+  }
+  state.last_checked_submission = current_submission_index_;
+  if (current_submission_index_ != verify_last_reported_submission_ &&
+      !(current_submission_index_ % 600)) {
+    verify_last_reported_submission_ = current_submission_index_;
+    REXGPU_INFO("REX_VERIFY_TEXTURES alive: textures checked={} stale={} (submission {})",
+                verify_textures_checked_, verify_textures_stale_, current_submission_index_);
+  }
+
+  auto global_lock = global_critical_region_.Acquire();
+  auto check = [&](bool is_mips) {
+    bool known = is_mips ? state.mips_known : state.base_known;
+    bool& reported = is_mips ? state.mips_reported : state.base_reported;
+    bool outdated =
+        is_mips ? texture.mips_outdated(global_lock) : texture.base_outdated(global_lock);
+    if (!known || reported || outdated) {
+      return;
+    }
+    uint32_t start = (is_mips ? key.mip_page : key.base_page) << 12;
+    uint32_t length = is_mips ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+    uint32_t gpu_written_pages = 0;
+    uint64_t hash = shared_memory().HashGuestRangeCpuPages(start, length, &gpu_written_pages);
+    ++verify_textures_checked_;
+    uint64_t loaded_hash = is_mips ? state.mips_hash : state.base_hash;
+    uint32_t loaded_gpu_written_pages =
+        is_mips ? state.mips_gpu_written_pages : state.base_gpu_written_pages;
+    if (hash == loaded_hash && gpu_written_pages == loaded_gpu_written_pages) {
+      return;
+    }
+    ++verify_textures_stale_;
+    reported = true;
+    REXGPU_WARN(
+        "TEXSTALE sub={} draw={} tf{} {} {:08X}+{:X} of {}x{}x{} fmt={} tiled={}: loaded at "
+        "sub={} from bytes hashing {:016X} ({} GPU-written pages), guest memory now hashes "
+        "{:016X} ({} GPU-written pages), texture not marked outdated",
+        current_submission_index_, diag::CurrentDrawIndex(), fetch_constant_index,
+        is_mips ? "mips" : "base", start, length, key.GetWidth(), key.GetHeight(),
+        key.GetDepthOrArraySize(), uint32_t(key.format), uint32_t(key.tiled),
+        is_mips ? state.mips_loaded_submission : state.base_loaded_submission, loaded_hash,
+        loaded_gpu_written_pages, hash, gpu_written_pages);
+  };
+  check(false);
+  check(true);
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -587,6 +740,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
   }
+
+  if (diag::VerifyTextures()) {
+    VerifyBoundTextures(used_texture_mask);
+  }
 }
 
 const char* TextureCache::TextureKey::GetLogDimensionName(xenos::DataDimension dimension) {
@@ -653,12 +810,21 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
   // Never try to upload data that doesn't exist.
   base_outdated_ = guest_layout().base.level_data_extent_bytes != 0;
   mips_outdated_ = guest_layout().mips_total_extent_bytes != 0;
+  if (diag::LoggedTextureBase() == (uint32_t(key_.base_page) << 12)) {
+    REXGPU_INFO("TEXWATCHED created {}x{}x{} fmt={} base={:08X} size={:X} mips={:08X} size={:X}",
+                key_.GetWidth(), key_.GetHeight(), key_.GetDepthOrArraySize(),
+                uint32_t(key_.format), uint32_t(key_.base_page) << 12, GetGuestBaseSize(),
+                uint32_t(key_.mip_page) << 12, GetGuestMipsSize());
+  }
   outdated_mask_.store(
       (base_outdated_ ? kOutdatedBitBase : 0) | (mips_outdated_ ? kOutdatedBitMips : 0),
       std::memory_order_relaxed);
 }
 
 TextureCache::Texture::~Texture() {
+  if (diag::LoggedTextureBase() == (uint32_t(key_.base_page) << 12)) {
+    REXGPU_INFO("TEXWATCHED destroyed base={:08X}", uint32_t(key_.base_page) << 12);
+  }
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }
@@ -683,16 +849,21 @@ TextureCache::Texture::~Texture() {
 }
 
 void TextureCache::Texture::MakeUpToDateAndWatch(
-    const std::unique_lock<std::recursive_mutex>& global_lock) {
+    const std::unique_lock<std::recursive_mutex>& global_lock, bool base, bool mips) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
-  if (base_outdated_) {
+  if (base && base_outdated_) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+    if (diag::LoggedTextureBase() == (uint32_t(key().base_page) << 12)) {
+      REXGPU_INFO("TEXWATCHED watch registered base={:08X}+{:X} handle={}",
+                  uint32_t(key().base_page) << 12, GetGuestBaseSize(),
+                  static_cast<void*>(base_watch_handle_));
+    }
   }
-  if (mips_outdated_) {
+  if (mips && mips_outdated_) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = false;
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
@@ -741,6 +912,10 @@ void TextureCache::Texture::WatchCallback(
     base_watch_handle_ = nullptr;
     outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
   }
+  if (diag::LoggedTextureBase() == (uint32_t(key_.base_page) << 12)) {
+    REXGPU_INFO("TEXWATCHED watch fired base={:08X} {}", uint32_t(key_.base_page) << 12,
+                is_mip ? "mips" : "base");
+  }
 }
 
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
@@ -758,16 +933,34 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
-  // Check if the texture is a scaled resolve texture.
+  // The load from the scaled resolve buffer is all-or-nothing: every page it
+  // reads must have been resolved, or the rest fills with leftovers.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-    if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
-         IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
-        (scaled_resolve_guest_layout.mips_total_extent_bytes &&
-         IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+    uint32_t base_extent_bytes = scaled_resolve_guest_layout.base.level_data_extent_bytes;
+    uint32_t mips_extent_bytes = scaled_resolve_guest_layout.mips_total_extent_bytes;
+    bool base_resolved =
+        base_extent_bytes && IsRangeFullyScaledResolved(key.base_page << 12, base_extent_bytes);
+    bool mips_resolved =
+        mips_extent_bytes && IsRangeFullyScaledResolved(key.mip_page << 12, mips_extent_bytes);
+    if ((base_resolved || !base_extent_bytes) && (mips_resolved || !mips_extent_bytes) &&
+        (base_resolved || mips_resolved)) {
       key.scaled_resolve = 1;
+      // Companion of TEXLOAD/DRAWLOG: which ranges promoted a texture to the
+      // scaled-resolve source.
+      static const bool log_draws = std::getenv("REX_LOG_DRAWS") != nullptr ||
+                                    std::getenv("REX_LOG_READBACK") != nullptr;
+      if (log_draws && rex::graphics::diag::LogGateOpen()) {
+        static std::unordered_set<uint64_t> logged;
+        uint64_t dedup = (uint64_t(key.base_page) << 32) | (uint64_t(key.mip_page) << 2) |
+                         (uint64_t(base_resolved) << 1) | uint64_t(mips_resolved);
+        if (logged.size() < 4096 && logged.insert(dedup).second) {
+          REXGPU_INFO(
+              "SCALEDKEY base={:08X} mip={:08X} fmt={} base_resolved={} mips_resolved={}",
+              uint32_t(key.base_page) << 12, uint32_t(key.mip_page) << 12, uint32_t(key.format),
+              uint32_t(base_resolved), uint32_t(mips_resolved));
+        }
+      }
     }
   }
 
@@ -895,6 +1088,25 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   return CommitPreparedTextureLoad(pending_load);
 }
 
+namespace {
+
+// An invalid fetch constant is re-examined on every draw that binds it.
+// Reporting each distinct constant once keeps the signal and drops repeats.
+bool FirstSightingOfInvalidFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  const uint32_t dwords[6] = {fetch.dword_0, fetch.dword_1, fetch.dword_2,
+                              fetch.dword_3, fetch.dword_4, fetch.dword_5};
+  uint64_t hash = 1469598103934665603ull;  // FNV-1a
+  for (uint32_t dword : dwords) {
+    hash = (hash ^ dword) * 1099511628211ull;
+  }
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> seen;
+  std::lock_guard<std::mutex> lock(mutex);
+  return seen.insert(hash).second;
+}
+
+}  // namespace
+
 void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,
                                                 TextureKey& key_out, uint8_t* swizzled_signs_out) {
   // Reset the key and the signedness.
@@ -910,18 +1122,26 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
         break;
       }
-      REXGPU_WARN(
-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
-          "has \"invalid\" type! This is incorrect behavior, but you can try "
-          "bypassing this by launching Xenia with "
-          "--gpu_allow_invalid_fetch_constants=true.",
-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+      if (FirstSightingOfInvalidFetchConstant(fetch)) {
+        REXGPU_WARN(
+            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+            "has \"invalid\" type! This is incorrect behavior, but you can try "
+            "bypassing this by launching Xenia with "
+            "--gpu_allow_invalid_fetch_constants=true. Further identical "
+            "warnings for this constant are suppressed.",
+            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+            fetch.dword_5);
+      }
       return;
     default:
-      REXGPU_WARN(
-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
-          "is completely invalid!",
-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+      if (FirstSightingOfInvalidFetchConstant(fetch)) {
+        REXGPU_WARN(
+            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+            "is completely invalid! Further identical warnings for this "
+            "constant are suppressed.",
+            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+            fetch.dword_5);
+      }
       return;
   }
 
@@ -1057,6 +1277,37 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
     }
   }
   return false;
+}
+
+bool TextureCache::IsRangeFullyScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+  if (!IsDrawResolutionScaled()) {
+    return false;
+  }
+
+  start_unscaled = std::min(start_unscaled, SharedMemory::kBufferSize);
+  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
+  if (!length_unscaled) {
+    return false;
+  }
+
+  uint32_t page_first = start_unscaled >> 12;
+  uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
+  uint32_t block_first = page_first >> 5;
+  uint32_t block_last = page_last >> 5;
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint32_t check_bits = UINT32_MAX;
+    if (i == block_first) {
+      check_bits &= ~((UINT32_C(1) << (page_first & 31)) - 1);
+    }
+    if (i == block_last && (page_last & 31) != 31) {
+      check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
+    }
+    if ((scaled_resolve_pages_[i] & check_bits) != check_bits) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallbackThunk(

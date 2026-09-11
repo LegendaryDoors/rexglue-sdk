@@ -780,9 +780,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
             // If primitive reset with a non-0xFFFF index is used, replace with
             // 0xFFFF if 0xFFFF is not used as a real index, or with 0xFFFFFFFF
             // if it is.
-            // Writing to the trace irrespective of the cache lookup result
-            // because cache behavior depends on runtime configuration and
-            // state.
+            // Write to the trace irrespective of the cache lookup result, as
+            // cache behavior depends on runtime configuration and state.
             // Example of 16-bit reset index replacement: 415607D4.
             trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
             // Not specifying the primitive type in the cache key because not

@@ -9,11 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -32,7 +34,97 @@ void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
 }
 
+
+REXCVAR_DEFINE_BOOL(vulkan_gpu_checkpoints, false, "GPU/Vulkan",
+                    "Record a VK_NV_device_diagnostic_checkpoints marker before every "
+                    "draw and dispatch. Survives VK_ERROR_DEVICE_LOST, so it names what "
+                    "the GPU was executing when it died. Off by default - a checkpoint "
+                    "per draw is not free.");
+
+namespace {
+
+// VK_NV_device_diagnostic_checkpoints names the last command the GPU reached
+// before a device loss. Markers live in a fixed ring so they outlive it.
+struct GpuCheckpoint {
+  uint64_t index;
+  const char* kind;
+  uint32_t a, b, c;
+  // Which pipeline was bound: cross-reference against the handle logged by
+  // the pipeline cache at creation.
+  uint64_t pipeline;
+};
+
+constexpr size_t kGpuCheckpointRingSize = 4096;
+GpuCheckpoint g_gpu_checkpoints[kGpuCheckpointRingSize];
+std::atomic<uint64_t> g_gpu_checkpoint_counter{0};
+
+// Record into the ring only, for commands not worth a GPU checkpoint of their
+// own but that must appear in the window around a stalled command.
+void NoteGpuCommand(const char* kind, uint32_t a, uint32_t b, uint32_t c) {
+  const uint64_t index = g_gpu_checkpoint_counter.fetch_add(1, std::memory_order_relaxed);
+  GpuCheckpoint& slot = g_gpu_checkpoints[index % kGpuCheckpointRingSize];
+  slot.index = index;
+  slot.kind = kind;
+  slot.a = a;
+  slot.b = b;
+  slot.c = c;
+  slot.pipeline = 0;
+}
+
+const GpuCheckpoint* RecordGpuCheckpoint(const char* kind, uint32_t a, uint32_t b, uint32_t c,
+                                         uint64_t pipeline) {
+  const uint64_t index = g_gpu_checkpoint_counter.fetch_add(1, std::memory_order_relaxed);
+  GpuCheckpoint& slot = g_gpu_checkpoints[index % kGpuCheckpointRingSize];
+  slot.index = index;
+  slot.kind = kind;
+  slot.a = a;
+  slot.b = b;
+  slot.c = c;
+  slot.pipeline = pipeline;
+  return &slot;
+}
+
+}  // namespace
+
+void DeferredCommandBuffer::NoteGpuSubmissionBoundary(uint64_t submission_index,
+                                                      uint32_t wait_semaphore_count) {
+  if (!REXCVAR_GET(vulkan_gpu_checkpoints)) {
+    return;
+  }
+  NoteGpuCommand("---- SUBMIT ----", uint32_t(submission_index), wait_semaphore_count, 0);
+}
+
+void DeferredCommandBuffer::DumpGpuCheckpointWindow(uint64_t last_finished_index,
+                                                    uint32_t count) {
+  const uint64_t total = g_gpu_checkpoint_counter.load(std::memory_order_relaxed);
+  if (!total) {
+    REXGPU_ERROR("  (no checkpoints recorded - run with --vulkan_gpu_checkpoints=true)");
+    return;
+  }
+  const uint64_t oldest = total > kGpuCheckpointRingSize ? total - kGpuCheckpointRingSize : 0;
+  REXGPU_ERROR("  ---- commands after the last completed one (#{}) ----", last_finished_index);
+  for (uint32_t i = 1; i <= count; ++i) {
+    const uint64_t index = last_finished_index + i;
+    if (index >= total) {
+      break;
+    }
+    if (index < oldest) {
+      continue;  // overwritten
+    }
+    const GpuCheckpoint& slot = g_gpu_checkpoints[index % kGpuCheckpointRingSize];
+    if (slot.index != index) {
+      continue;  // raced with a write
+    }
+    REXGPU_ERROR("  {} #{} {} ({}, {}, {}) pipeline={:#x}", i == 1 ? "STALLED ->" : "          ",
+                 slot.index, slot.kind, slot.a, slot.b, slot.c, slot.pipeline);
+  }
+}
+
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+  const bool checkpoints_enabled =
+      REXCVAR_GET(vulkan_gpu_checkpoints) &&
+      command_processor_.GetVulkanDevice()->extensions().ext_NV_device_diagnostic_checkpoints;
+  uint64_t last_bound_pipeline = 0;
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -65,10 +157,16 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         } else {
           render_pass_begin_info.pClearValues = nullptr;
         }
+        if (checkpoints_enabled) {
+          NoteGpuCommand("beginRenderPass", render_pass_begin_info.renderArea.extent.width,
+                         render_pass_begin_info.renderArea.extent.height,
+                         render_pass_begin_info.clearValueCount);
+        }
         dfn.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, args.contents);
       } break;
 
       case Command::kVkBeginQuery: {
+        if (checkpoints_enabled) NoteGpuCommand("beginQuery", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkBeginQuery*>(stream);
         dfn.vkCmdBeginQuery(command_buffer, args.query_pool, args.query, args.flags);
       } break;
@@ -99,6 +197,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkBindPipeline: {
         auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
+        last_bound_pipeline = uint64_t(args.pipeline);
         dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point, args.pipeline);
       } break;
 
@@ -116,6 +215,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkClearAttachments: {
+        if (checkpoints_enabled) NoteGpuCommand("clearAttachments", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkClearAttachments*>(stream);
         size_t offset_bytes =
             rex::align(sizeof(ArgsVkClearAttachments), alignof(VkClearAttachment));
@@ -130,6 +230,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkClearColorImage: {
+        if (checkpoints_enabled) NoteGpuCommand("clearColorImage", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkClearColorImage*>(stream);
         dfn.vkCmdClearColorImage(
             command_buffer, args.image, args.image_layout, &args.color, args.range_count,
@@ -139,6 +240,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkCopyBuffer: {
+        if (checkpoints_enabled) NoteGpuCommand("copyBuffer", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
                             reinterpret_cast<const VkBufferCopy*>(
@@ -147,6 +249,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkCopyBufferToImage: {
+        if (checkpoints_enabled) NoteGpuCommand("copyBufferToImage", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
         dfn.vkCmdCopyBufferToImage(
             command_buffer, args.src_buffer, args.dst_image, args.dst_image_layout,
@@ -157,6 +260,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkCopyQueryPoolResults: {
+        // The only VK_QUERY_RESULT_WAIT_BIT in the SDK, a GPU-side wait that
+        // blocks retirement of everything after it. Worth a real checkpoint.
+        if (checkpoints_enabled) {
+          dfn.vkCmdSetCheckpointNV(command_buffer,
+                                   RecordGpuCheckpoint("copyQueryPoolResults", 0, 0, 0,
+                                                       last_bound_pipeline));
+        }
         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
                                       args.query_count, args.dst_buffer, args.dst_offset,
@@ -165,32 +275,55 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkDispatch: {
         auto& args = *reinterpret_cast<const ArgsVkDispatch*>(stream);
+        if (checkpoints_enabled) {
+          dfn.vkCmdSetCheckpointNV(command_buffer,
+                                   RecordGpuCheckpoint("dispatch", args.group_count_x,
+                                                       args.group_count_y, args.group_count_z,
+                                                       last_bound_pipeline));
+        }
         dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,
                           args.group_count_z);
       } break;
 
       case Command::kVkDraw: {
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
+        if (checkpoints_enabled) {
+          dfn.vkCmdSetCheckpointNV(command_buffer,
+                                   RecordGpuCheckpoint("draw", args.vertex_count,
+                                                       args.instance_count, args.first_vertex,
+                                                       last_bound_pipeline));
+        }
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
                       args.first_instance);
       } break;
 
       case Command::kVkDrawIndexed: {
         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
+        if (checkpoints_enabled) {
+          dfn.vkCmdSetCheckpointNV(command_buffer,
+                                   RecordGpuCheckpoint("drawIndexed", args.index_count,
+                                                       args.instance_count, args.first_index,
+                                                       last_bound_pipeline));
+        }
         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
                              args.first_index, args.vertex_offset, args.first_instance);
       } break;
 
       case Command::kVkEndQuery: {
+        if (checkpoints_enabled) NoteGpuCommand("endQuery", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkEndQuery*>(stream);
         dfn.vkCmdEndQuery(command_buffer, args.query_pool, args.query);
       } break;
 
       case Command::kVkEndRenderPass:
+        if (checkpoints_enabled) {
+          NoteGpuCommand("endRenderPass", 0, 0, 0);
+        }
         dfn.vkCmdEndRenderPass(command_buffer);
         break;
 
       case Command::kVkBeginRendering: {
+        if (checkpoints_enabled) NoteGpuCommand("beginRendering", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkBeginRendering*>(stream);
         size_t offset_bytes =
             rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
@@ -226,6 +359,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkEndRendering:
+        if (checkpoints_enabled) NoteGpuCommand("endRendering", 0, 0, 0);
         dfn.vkCmdEndRendering(command_buffer);
         break;
 
@@ -253,6 +387,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
               reinterpret_cast<const uint8_t*>(stream) + barrier_offset_bytes);
           barrier_offset_bytes += sizeof(VkImageMemoryBarrier) * args.image_memory_barrier_count;
         }
+        if (checkpoints_enabled) {
+          NoteGpuCommand("BARRIER src/dst stage", args.src_stage_mask, args.dst_stage_mask,
+                         args.memory_barrier_count + args.buffer_memory_barrier_count +
+                             args.image_memory_barrier_count);
+        }
         dfn.vkCmdPipelineBarrier(command_buffer, args.src_stage_mask, args.dst_stage_mask,
                                  args.dependency_flags, args.memory_barrier_count, memory_barriers,
                                  args.buffer_memory_barrier_count, buffer_memory_barriers,
@@ -267,6 +406,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkResetQueryPool: {
+        if (checkpoints_enabled) NoteGpuCommand("resetQueryPool", 0, 0, 0);
         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
                                 args.query_count);

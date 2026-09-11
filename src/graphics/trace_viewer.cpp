@@ -9,8 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include "thirdparty/half/include/half.hpp"
-
+// Vertex FLOAT16 values use rex::xenos_half_to_float, not an IEEE-754 half
+// library: the Xenos encoding is extended-range, with no infinity or NaN.
+#include <algorithm>
 #include <cinttypes>
 #include <string>
 
@@ -35,7 +36,6 @@
 #include <rex/system.h>
 #include <rex/system/kernel_state.h>
 #include <rex/thread.h>
-#include <rex/ui/file_picker.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/presenter.h>
@@ -46,7 +46,7 @@
 
 #include <imgui.h>
 
-DEFINE_string(target_trace_file, "", "Specifies the trace file to load.", "GPU");
+REXCVAR_DEFINE_STRING(target_trace_file, "", "GPU", "Specifies the trace file to load.");
 
 namespace rex::graphics {
 
@@ -55,6 +55,27 @@ using namespace rex::graphics::xenos;
 static const ImVec4 kColorError = ImVec4(255 / 255.0f, 0 / 255.0f, 0 / 255.0f, 255 / 255.0f);
 static const ImVec4 kColorComment = ImVec4(42 / 255.0f, 179 / 255.0f, 0 / 255.0f, 255 / 255.0f);
 static const ImVec4 kColorIgnored = ImVec4(100 / 255.0f, 100 / 255.0f, 100 / 255.0f, 255 / 255.0f);
+
+// ImGui::CalcListClipping() was removed in Dear ImGui 1.89, and the lists
+// that used it cannot use ImGuiListClipper, so it is reproduced here.
+static void CalcUniformListClipping(int items_count, float items_height, int* out_display_start,
+                                    int* out_display_end) {
+  if (items_count <= 0 || items_height <= 0.0f) {
+    *out_display_start = 0;
+    *out_display_end = 0;
+    return;
+  }
+  const float scroll_y = ImGui::GetScrollY();
+  const float visible_height = ImGui::GetWindowHeight();
+  // One row of overscan on the bottom edge, matching the old behaviour of
+  // rounding the end of the range up to the next whole row.
+  int start = static_cast<int>(scroll_y / items_height);
+  int end = static_cast<int>((scroll_y + visible_height) / items_height) + 1;
+  start = std::clamp(start, 0, items_count);
+  end = std::clamp(end, start, items_count);
+  *out_display_start = start;
+  *out_display_end = end;
+}
 
 TraceViewer::TraceViewer(rex::ui::WindowedAppContext& app_context, const std::string_view name)
     : rex::ui::WindowedApp(app_context, name, "some.trace"), window_listener_(*this) {
@@ -66,32 +87,24 @@ TraceViewer::~TraceViewer() = default;
 bool TraceViewer::OnInitialize() {
   std::string path = REXCVAR_GET(target_trace_file);
 
-  // If no path passed, ask the user.
-  // On Android, however, there's no synchronous file picker, and the trace file
-  // must be picked externally and provided to the trace viewer activity via the
-  // intent.
-#if !REX_PLATFORM_ANDROID
+  // A bare positional argument arrives through SetParsedArguments, a separate
+  // map from the cvar system, so fall back to the positional value.
   if (path.empty()) {
-    auto file_picker = rex::ui::FilePicker::Create();
-    file_picker->set_mode(ui::FilePicker::Mode::kOpen);
-    file_picker->set_type(ui::FilePicker::Type::kFile);
-    file_picker->set_multi_selection(false);
-    file_picker->set_title("Select Trace File");
-    file_picker->set_extensions({
-        {"Supported Files", "*.xtr"},
-        {"All Files (*.*)", "*.*"},
-    });
-    if (file_picker->Show()) {
-      auto selected_files = file_picker->selected_files();
-      if (!selected_files.empty()) {
-        path = rex::path_to_utf8(selected_files[0]);
-      }
+    if (auto positional = GetArgument("target_trace_file")) {
+      path = *positional;
     }
   }
-#endif  // !REX_PLATFORM_ANDROID
 
+  // Xenia opened a file picker here. There is no rex::ui::FilePicker yet, so
+  // the trace path must be given on the command line. A missing feature.
   if (path.empty()) {
-    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Warning, "No trace file specified");
+    rex::ShowSimpleMessageBox(
+        rex::SimpleMessageBoxType::Warning,
+        "No trace file specified.\n\n"
+        "Usage: rex-trace-viewer <trace.xtr>\n"
+        "   or: rex-trace-viewer --target_trace_file=<trace.xtr>\n\n"
+        "Traces are captured with --trace_gpu_stream=true --trace_gpu_prefix=<dir>.\n"
+        "trace_gpu_prefix is a directory; the file is named <title_id>_stream.xtr.");
     return false;
   }
 
@@ -123,16 +136,30 @@ bool TraceViewer::Setup() {
     return false;
   }
 
-  // Create the emulator but don't initialize so we can setup the window.
-  emulator_ = std::make_unique<Emulator>("", "", "", "");
-  X_STATUS result = emulator_->Setup(
-      window_.get(), nullptr, false, nullptr, [this]() { return CreateGraphicsSystem(); }, nullptr);
+  // Publish the app context before Setup: Runtime only builds a presenter when
+  // app_context_ is non-null, and the viewer draws through that presenter.
+  emulator_ = std::make_unique<Runtime>("", "", "", "");
+  emulator_->set_app_context(&app_context());
+
+  // Keep a typed pointer to the graphics system: RuntimeConfig takes ownership
+  // as IGraphicsSystem, but the viewer needs the concrete GraphicsSystem.
+  std::unique_ptr<GraphicsSystem> graphics_system = CreateGraphicsSystem();
+  if (!graphics_system) {
+    REXGPU_ERROR("Failed to create the graphics system");
+    return false;
+  }
+  graphics_system_ = graphics_system.get();
+
+  // tool_mode stays false on purpose: it skips GPU initialization entirely.
+  RuntimeConfig config;
+  config.graphics = std::move(graphics_system);
+
+  X_STATUS result = emulator_->Setup(std::move(config));
   if (XFAILED(result)) {
-    REXGPU_ERROR("Failed to setup emulator: {:08X}", result);
+    REXGPU_ERROR("Failed to setup runtime: {:08X}", result);
     return false;
   }
   memory_ = emulator_->memory();
-  graphics_system_ = emulator_->graphics_system();
 
   player_ = std::make_unique<TracePlayer>(graphics_system_);
 
@@ -247,7 +274,7 @@ void TraceViewer::DrawControllerUI() {
     ImGui::SetTooltip("Skip to last frame");
   }
   if (player_->is_playing_trace()) {
-    // Don't allow the user to change the frame index just yet...
+    // Don't allow changing the frame index just yet...
     // TODO: Find a way to disable the slider below.
     target_frame = player_->current_frame_index();
   }
@@ -537,7 +564,7 @@ void TraceViewer::DrawCommandListUI() {
     ImGui::SetTooltip("Move to the last command");
   }
   if (player_->is_playing_trace()) {
-    // Don't allow the user to change the command index just yet...
+    // Don't allow changing the command index just yet...
     // TODO: Find a way to disable the slider below.
     target_command = player_->current_command_index();
   }
@@ -792,7 +819,7 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
   ImGui::BeginChild("#indices", ImVec2(0, 300));
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 0));
   int display_start, display_end;
-  ImGui::CalcListClipping(vertex_count, ImGui::GetTextLineHeight(), &display_start, &display_end);
+  CalcUniformListClipping(vertex_count, ImGui::GetTextLineHeight(), &display_start, &display_end);
   ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
   ImGui::Columns(column_count);
   if (display_start <= 1) {
@@ -872,9 +899,9 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
         } break;
         case xenos::VertexFormat::k_16_16_FLOAT: {
           auto e0 = LOADEL(uint32_t, 0);
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float(uint16_t(e0 >> 16)));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float(uint16_t(e0)));
           ImGui::NextColumn();
         } break;
         case xenos::VertexFormat::k_32_32:
@@ -946,13 +973,13 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
         case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
           auto e0 = LOADEL(uint32_t, 0);
           auto e1 = LOADEL(uint32_t, 1);
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float(uint16_t(e0 >> 16)));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float(uint16_t(e0)));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e1 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float(uint16_t(e1 >> 16)));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e1 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", rex::xenos_half_to_float(uint16_t(e1)));
           ImGui::NextColumn();
         } break;
         case xenos::VertexFormat::k_32_32_32_32_FLOAT:
@@ -1569,7 +1596,7 @@ void TraceViewer::DrawStateUI() {
       ImGui::BeginChild("#vsvertices", ImVec2(0, 300));
 
       int display_start, display_end;
-      ImGui::CalcListClipping(int(vertices.size() / 4), ImGui::GetTextLineHeight(), &display_start,
+      CalcUniformListClipping(int(vertices.size() / 4), ImGui::GetTextLineHeight(), &display_start,
                               &display_end);
       ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
 
@@ -1631,7 +1658,7 @@ void TraceViewer::DrawStateUI() {
       ImGui::BeginChild("#indices", ImVec2(0, 300));
       ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
       int display_start, display_end;
-      ImGui::CalcListClipping(1 + draw_info.index_count, ImGui::GetTextLineHeight(), &display_start,
+      CalcUniformListClipping(1 + draw_info.index_count, ImGui::GetTextLineHeight(), &display_start,
                               &display_end);
       ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
       ImGui::Columns(2, "#indices", true);

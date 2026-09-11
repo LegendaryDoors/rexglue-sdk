@@ -15,6 +15,7 @@
 
 #include <rex/input/input.h>
 #include <rex/input/input_driver.h>
+#include <rex/input/input_playback.h>
 #include <rex/system/interfaces/input.h>
 
 namespace rex::ui {
@@ -46,6 +47,11 @@ class InputSystem : public system::IInputSystem {
   rex::ui::Window* window_ = nullptr;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
+
+  // Timeline record/replay (--input_record / --input_script), created in
+  // Setup(). Null unless the cvars are set.
+  std::unique_ptr<InputReplayer> replayer_;
+  std::unique_ptr<InputRecorder> recorder_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

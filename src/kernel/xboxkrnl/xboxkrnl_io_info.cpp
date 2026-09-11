@@ -31,6 +31,8 @@
 #include <rex/thread/mutex.h>
 
 namespace rex::kernel::xboxkrnl {
+
+bool FileOpsLogged(std::string_view path);  // xboxkrnl_io.cpp
 using namespace rex::system;
 
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
@@ -108,6 +110,11 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
                                  mapped_void info_ptr, u32 info_length, u32 info_class) {
   uint32_t minimum_length = GetQueryFileInfoMinimumLength(info_class);
   if (!minimum_length) {
+    auto logged = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+    if (logged && FileOpsLogged(logged->path())) {
+      REXKRNL_INFO("FILEOP query handle={:#x} class={} -> unsupported class", (uint32_t)file_handle,
+                   (uint32_t)info_class);
+    }
     return X_STATUS_INVALID_INFO_CLASS;
   }
 
@@ -196,6 +203,11 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
     io_status_block_ptr->status = status;
     io_status_block_ptr->information = out_length;
   }
+  if (FileOpsLogged(file->path())) {
+    REXKRNL_INFO("FILEOP query handle={:#x} class={} -> {:#x} len={} pos={} size={}",
+                 (uint32_t)file_handle, (uint32_t)info_class, status, out_length,
+                 file->position(), file->entry()->size());
+  }
 
   return status;
 }
@@ -235,6 +247,11 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
                                mapped_void info_ptr, u32 info_length, u32 info_class) {
   uint32_t minimum_length = GetSetFileInfoMinimumLength(info_class);
   if (!minimum_length) {
+    auto logged = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+    if (logged && FileOpsLogged(logged->path())) {
+      REXKRNL_INFO("FILEOP set handle={:#x} class={} -> unsupported class", (uint32_t)file_handle,
+                   (uint32_t)info_class);
+    }
     return X_STATUS_INVALID_INFO_CLASS;
   }
 
@@ -348,6 +365,10 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
   if (io_status_block) {
     io_status_block->status = result;
     io_status_block->information = out_length;
+  }
+  if (FileOpsLogged(file->path())) {
+    REXKRNL_INFO("FILEOP set handle={:#x} class={} -> {:#x} pos={} size={}", (uint32_t)file_handle,
+                 (uint32_t)info_class, result, file->position(), file->entry()->size());
   }
 
   return result;

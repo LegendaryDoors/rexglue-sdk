@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -19,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/system.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
@@ -36,7 +38,46 @@
 
 namespace {
 
+#if defined(__x86_64__) || defined(_M_X64)
+// The build assumes the instruction set it was compiled for. On an older
+// processor the first such instruction crashes with no message.
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((target("no-avx2,no-avx,no-bmi2,no-bmi,no-fma")))
+#endif
+static const char* MissingCpuFeature() {
+#if REX_PLATFORM_WIN32
+  // The system call rather than the compiler builtin: clang's builtin needs
+  // compiler-rt, which its Windows driver does not link.
+#if defined(__AVX2__)
+  if (!IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)) return "AVX2 (Intel from 2013 or AMD from 2015)";
+#endif
+  if (!IsProcessorFeaturePresent(PF_SSE4_2_INSTRUCTIONS_AVAILABLE)) return "SSE4.2 (Intel from 2008 or AMD from 2011)";
+#elif defined(__clang__) || defined(__GNUC__)
+  __builtin_cpu_init();
+#if defined(__AVX2__)
+  if (!__builtin_cpu_supports("avx2")) return "AVX2 (Intel from 2013 or AMD from 2015)";
+#endif
+#if defined(__SSE4_2__)
+  if (!__builtin_cpu_supports("sse4.2")) return "SSE4.2 (Intel from 2008 or AMD from 2011)";
+#endif
+#if defined(__SSE4_1__)
+  if (!__builtin_cpu_supports("sse4.1")) return "SSE4.1 (Intel from 2007 or AMD from 2011)";
+#endif
+#endif
+  return nullptr;
+}
+#endif
+
 int RunWindowedApp(int argc, char** argv) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (const char* missing = MissingCpuFeature()) {
+    const std::string message =
+        std::string("This build needs a processor with ") + missing + ", which this one does not have.";
+    std::fprintf(stderr, "%s\n", message.c_str());
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, message);
+    return 1;
+  }
+#endif
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();

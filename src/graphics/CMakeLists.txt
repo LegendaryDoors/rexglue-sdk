@@ -8,6 +8,7 @@ set(REXGPU_XENOS_SOURCES
     plugin_main.cpp
 
     # Core GPU types
+    diagnostic_gate.cpp
     flags.cpp
     register_file.cpp
     registers.cpp
@@ -141,4 +142,78 @@ if(REXGLUE_USE_D3D12)
         dxgi
         dxguid
     )
+endif()
+
+# ---------------------------------------------------------------------------
+# rex-trace-viewer: replay and inspect a captured .xtr GPU trace.
+#
+# A separate executable rather than an entry point in rexgpu-xenos, which every
+# title loads. imgui is resolved from rexruntime, so it is not linked here.
+# ---------------------------------------------------------------------------
+option(REXGLUE_BUILD_TRACE_TOOLS "Build the GPU trace viewer and dumper tools" ON)
+
+if(REXGLUE_BUILD_TRACE_TOOLS AND REXGLUE_USE_VULKAN)
+    # Same sources as the plugin, minus its C ABI entry point. Both tools are
+    # Vulkan-only, so drop the D3D12/DXBC translation units when present.
+    set(REX_TRACE_TOOL_SOURCES ${REXGPU_XENOS_SOURCES})
+    list(REMOVE_ITEM REX_TRACE_TOOL_SOURCES plugin_main.cpp)
+    if(REXGLUE_USE_D3D12)
+        list(REMOVE_ITEM REX_TRACE_TOOL_SOURCES
+            ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
+            ${REXGPU_XENOS_DXBC_SOURCES}
+            ${REXGPU_XENOS_D3D12_SOURCES})
+    endif()
+
+    # Shared replay core, compiled only into the trace tools.
+    set(REX_TRACE_REPLAY_SOURCES
+        trace_reader.cpp
+        trace_player.cpp
+    )
+
+    # --- rex-trace-viewer: interactive -------------------------------------
+    add_executable(rex-trace-viewer
+        ${REX_TRACE_TOOL_SOURCES}
+        ${REX_TRACE_REPLAY_SOURCES}
+        trace_viewer.cpp
+        vulkan/trace_viewer.cpp
+
+        # Provides main(). Deliberately not part of rexui: on desktop each
+        # windowed app is its own executable.
+        ${REXGLUE_ROOT}/src/ui/windowed_app_main_sdl.cpp
+    )
+    add_executable(rex::trace-viewer ALIAS rex-trace-viewer)
+
+    # --- rex-trace-dump: headless ------------------------------------------
+    # Replays to a chosen frame/command and writes a PNG, with no display.
+    add_executable(rex-trace-dump
+        ${REX_TRACE_TOOL_SOURCES}
+        ${REX_TRACE_REPLAY_SOURCES}
+        trace_dump.cpp
+        vulkan/trace_dump.cpp
+    )
+    add_executable(rex::trace-dump ALIAS rex-trace-dump)
+
+    foreach(_trace_tool rex-trace-viewer rex-trace-dump)
+        target_include_directories(${_trace_tool} PRIVATE
+            ${REXGLUE_ROOT}/thirdparty/renderdoc
+            ${REXGLUE_ROOT}
+            ${REXGLUE_ROOT}/thirdparty/imgui  # headers only - see note above
+        )
+
+        target_compile_options(${_trace_tool} PRIVATE -Wno-unused-variable)
+
+        target_link_libraries(${_trace_tool} PRIVATE
+            rexruntime
+            xxHash::xxhash
+            snappy
+            volk::volk
+            glslang::SPIRV
+            GPUOpen::VulkanMemoryAllocator
+            glslang
+            MachineIndependent
+            GenericCodeGen
+            OSDependent
+            OGLCompiler
+        )
+    endforeach()
 endif()

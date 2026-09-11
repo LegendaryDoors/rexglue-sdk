@@ -669,6 +669,17 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
+  // No window means OnWindowAvailable never ran, so there is no UI thread to
+  // queue the pump onto. Warn once rather than reporting no controllers.
+  if (!attached_window_) {
+    if (!warned_no_window_.exchange(true)) {
+      REXLOG_WARN(
+          "SDL input driver was never attached to a window; input is dead. "
+          "The host must call InputSystem::AttachWindow() after creating its window.");
+    }
+    return;
+  }
+
   // Pump SDL events to ensure controller state is up to date.
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);

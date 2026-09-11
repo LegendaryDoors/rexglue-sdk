@@ -123,6 +123,8 @@ struct X_FIBER_CONTEXT {
   uint8_t register_save_area[0xA50 - 0x38];  // non-volatile PPCContext register save area
 };
 static_assert_size(X_FIBER_CONTEXT, 0xA50);
+static_assert(sizeof(X_FIBER_CONTEXT::register_save_area) >= ::PPCContext::kNonVolatileSaveSize,
+              "fiber register save area too small for PPCContext non-volatiles");
 
 struct X_KTHREAD;
 struct X_KPROCESS;
@@ -334,6 +336,18 @@ class XThread : public XObject {
   uint32_t last_error();
   void set_last_error(uint32_t error_code);
   void set_name(const std::string_view name);
+  // The guest-visible thread name ("3D Engine (F800007C)"). XObject::name()
+  // is a different field, empty for threads, so diagnostics use this one.
+  const std::string& thread_name() const { return thread_name_; }
+
+  // Guest critical section this thread is currently blocked acquiring, or 0.
+  // Kept on the thread so recording it costs one relaxed atomic store.
+  uint32_t blocked_on_critical_section() const {
+    return blocked_on_critical_section_.load(std::memory_order_relaxed);
+  }
+  void set_blocked_on_critical_section(uint32_t cs_ptr) {
+    blocked_on_critical_section_.store(cs_ptr, std::memory_order_relaxed);
+  }
 
   X_STATUS Create();
   X_STATUS Exit(int exit_code);
@@ -421,6 +435,7 @@ class XThread : public XObject {
   std::atomic<bool> running_{false};
 
   std::string thread_name_;
+  std::atomic<uint32_t> blocked_on_critical_section_{0};
   std::unique_ptr<runtime::ThreadState> thread_state_;
 
   int32_t priority_ = 0;

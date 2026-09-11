@@ -70,7 +70,7 @@ MnkInputDriver::~MnkInputDriver() {
 }
 
 X_STATUS MnkInputDriver::Setup() {
-  REXLOG_INFO("MnK input driver initialized");
+  REXLOG_INFO("MnK input driver initialized ({})", IsEnabled() ? "keyboard and mouse on" : "off");
   return X_STATUS_SUCCESS;
 }
 

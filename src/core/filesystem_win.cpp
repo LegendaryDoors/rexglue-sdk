@@ -55,7 +55,9 @@ std::filesystem::path GetExecutableFolder() {
 std::filesystem::path GetUserFolder() {
   std::filesystem::path result;
   PWSTR path;
-  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &path))) {
+  // Local application data, the counterpart of ~/.local/share: never synced
+  // to the cloud, which Documents can be, and a game directory is gigabytes.
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &path))) {
     result.assign(path);
     CoTaskMemFree(path);
   }

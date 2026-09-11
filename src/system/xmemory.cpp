@@ -10,8 +10,15 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
+
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 
 #include <fmt/format.h>
 
@@ -99,6 +106,8 @@ Memory::~Memory() {
   assert_true(active_memory_ == this);
   active_memory_ = nullptr;
 
+  StopWatchMemDiagnostic();
+
   // Uninstall the MMIO handler, as we won't be able to service more requests.
   mmio_handler_.reset();
 
@@ -159,6 +168,10 @@ bool Memory::Initialize() {
   }
   virtual_membase_ = mapping_base_;
   physical_membase_ = mapping_base_ + 0x100000000ull;
+
+  REXSYS_INFO("Guest memory arena mapped: virtual base 0x{:016X}, physical base 0x{:016X}",
+              reinterpret_cast<uintptr_t>(virtual_membase_),
+              reinterpret_cast<uintptr_t>(physical_membase_));
 
   // Prepare virtual heaps.
   heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
@@ -227,6 +240,18 @@ bool Memory::Initialize() {
 
   uint32_t value_to_write = rex::byte_swap(uint32_t(0x2a6e3f38));
   std::memcpy(TranslateVirtual(0x80000000 + 0x1C), &value_to_write, sizeof(uint32_t));
+
+  if (const char* watch_spec = std::getenv("REX_WATCH_MEM")) {
+    char* separator = nullptr;
+    uint64_t watch_base = std::strtoull(watch_spec, &separator, 16);
+    uint64_t watch_length =
+        (separator && *separator == ':') ? std::strtoull(separator + 1, nullptr, 16) : 0;
+    const uint64_t kPhysicalSize = 0x20000000ull;
+    if (watch_length && watch_base < kPhysicalSize) {
+      StartWatchMemDiagnostic(uint32_t(watch_base),
+                              uint32_t(std::min(watch_length, kPhysicalSize - watch_base)));
+    }
+  }
 
   return true;
 }
@@ -461,10 +486,11 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   }
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
-  if (!heap) {
-    return false;
-  }
-  if (heap->heap_type() != memory::HeapType::kGuestPhysical) {
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    REXSYS_ERROR(
+        "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+        is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+        rex::thread::current_thread_id());
     return false;
   }
 
@@ -606,6 +632,159 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vE0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
+}
+
+void Memory::StartWatchMemDiagnostic(uint32_t physical_address, uint32_t length) {
+  if (watch_mem_callback_handle_ || !length) {
+    return;
+  }
+  watch_mem_base_ = physical_address;
+  watch_mem_length_ = length;
+  watch_mem_page_hits_.assign((size_t(length) + system_page_size_ - 1) / system_page_size_, 0);
+  watch_mem_callback_handle_ =
+      RegisterPhysicalMemoryInvalidationCallback(WatchMemCallbackThunk, this);
+  watch_mem_stop_.store(false);
+  watch_mem_thread_ = std::thread([this] { WatchMemThread(); });
+  REXSYS_WARN("REX_WATCH_MEM page write watch armed on {:#010X}+{:#X} ({} pages)",
+              physical_address, length, watch_mem_page_hits_.size());
+}
+
+void Memory::StopWatchMemDiagnostic() {
+  if (!watch_mem_callback_handle_) {
+    return;
+  }
+  watch_mem_stop_.store(true);
+  if (watch_mem_thread_.joinable()) {
+    watch_mem_thread_.join();
+  }
+  UnregisterPhysicalMemoryInvalidationCallback(watch_mem_callback_handle_);
+  watch_mem_callback_handle_ = nullptr;
+}
+
+std::pair<uint32_t, uint32_t> Memory::WatchMemCallbackThunk(void* context_ptr,
+                                                            uint32_t physical_address_start,
+                                                            uint32_t length, bool exact_range) {
+  return reinterpret_cast<Memory*>(context_ptr)
+      ->WatchMemCallback(physical_address_start, length, exact_range);
+}
+
+std::pair<uint32_t, uint32_t> Memory::WatchMemCallback(uint32_t physical_address_start,
+                                                       uint32_t length, bool exact_range) {
+  const std::pair<uint32_t, uint32_t> unwatch_anything(0, UINT32_MAX);
+  uint64_t start = physical_address_start;
+  uint64_t end = start + length;
+  uint64_t watch_end = uint64_t(watch_mem_base_) + watch_mem_length_;
+  if (!length || start >= watch_end || end <= watch_mem_base_) {
+    return unwatch_anything;
+  }
+  uint32_t hit_start = uint32_t(std::max<uint64_t>(start, watch_mem_base_));
+  uint32_t hit_end = uint32_t(std::min<uint64_t>(end, watch_end));
+  uint32_t page_first = (hit_start - watch_mem_base_) / system_page_size_;
+  uint32_t page_last = (hit_end - 1 - watch_mem_base_) / system_page_size_;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    ++watch_mem_page_hits_[page];
+  }
+  // Unwatching exactly the faulting pages keeps the page map exact: a wider
+  // unwatch would let a sequential writer run on without faulting again.
+  const std::pair<uint32_t, uint32_t> unwatch_exact(physical_address_start, length);
+#if defined(__linux__)
+  // A writer is identified by its backtrace, not by the page it touches, so a
+  // clear and then a fill of the same pages shows as two writers.
+  void* frames[24];
+  int frame_count = backtrace(frames, 24);
+  std::vector<void*> current_frames(frames, frames + std::max(frame_count, 0));
+  for (WatchMemWriter& writer : watch_mem_writers_) {
+    if (writer.frames == current_frames) {
+      for (uint32_t page = page_first; page <= page_last; ++page) {
+        writer.pages[page] = 1;
+      }
+      return unwatch_exact;
+    }
+  }
+  const size_t kMaxWritersPerEpoch = 64;
+  if (watch_mem_writers_.size() >= kMaxWritersPerEpoch) {
+    ++watch_mem_writers_dropped_;
+    return unwatch_exact;
+  }
+  WatchMemWriter& writer = watch_mem_writers_.emplace_back();
+  writer.frames = std::move(current_frames);
+  writer.pages.assign(watch_mem_page_hits_.size(), 0);
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    writer.pages[page] = 1;
+  }
+  REXSYS_WARN(
+      "REX_WATCH_MEM writer #{} first seen at {:#010X}+{:#X} (pages {}-{} of the watched range, "
+      "exact={}, thread {:#X})",
+      watch_mem_writers_.size() - 1, hit_start, hit_end - hit_start, page_first, page_last,
+      exact_range, rex::thread::current_thread_id());
+  for (int i = 0; i < frame_count; ++i) {
+    Dl_info info;
+    if (dladdr(frames[i], &info) && info.dli_sname) {
+      REXSYS_WARN("REX_WATCH_MEM   frame {}: {}+{:#x}", i, info.dli_sname,
+                  uintptr_t(frames[i]) - uintptr_t(info.dli_saddr));
+    } else if (dladdr(frames[i], &info) && info.dli_fname) {
+      REXSYS_WARN("REX_WATCH_MEM   frame {}: {}+{:#x}", i, info.dli_fname,
+                  uintptr_t(frames[i]) - uintptr_t(info.dli_fbase));
+    } else {
+      REXSYS_WARN("REX_WATCH_MEM   frame {}: {:#x}", i, uintptr_t(frames[i]));
+    }
+  }
+#endif
+  return unwatch_exact;
+}
+
+void Memory::WatchMemThread() {
+  // Runs of consecutive written pages as address ranges.
+  auto page_runs = [this](auto hit_at, size_t page_count) {
+    std::string runs;
+    for (size_t page = 0; page < page_count;) {
+      if (!hit_at(page)) {
+        ++page;
+        continue;
+      }
+      size_t run_end = page;
+      while (run_end + 1 < page_count && hit_at(run_end + 1)) {
+        ++run_end;
+      }
+      runs += fmt::format(" {:#010X}-{:#010X}", watch_mem_base_ + page * system_page_size_,
+                          watch_mem_base_ + (run_end + 1) * system_page_size_ - 1);
+      page = run_end + 1;
+    }
+    return runs;
+  };
+  for (uint32_t tick = 0; !watch_mem_stop_.load(std::memory_order_relaxed); ++tick) {
+    EnablePhysicalMemoryAccessCallbacks(watch_mem_base_, watch_mem_length_, true, false);
+    if (tick % 4000 == 3999) {
+      std::string map;
+      std::vector<std::string> writer_runs;
+      uint32_t dropped = 0;
+      {
+        auto global_lock = global_critical_region_.Acquire();
+        size_t page_count = watch_mem_page_hits_.size();
+        map = page_runs([this](size_t page) { return watch_mem_page_hits_[page] != 0; },
+                        page_count);
+        for (const WatchMemWriter& writer : watch_mem_writers_) {
+          writer_runs.push_back(
+              page_runs([&writer](size_t page) { return writer.pages[page] != 0; }, page_count));
+        }
+        dropped = watch_mem_writers_dropped_;
+        std::fill(watch_mem_page_hits_.begin(), watch_mem_page_hits_.end(), 0);
+        watch_mem_writers_.clear();
+        watch_mem_writers_dropped_ = 0;
+      }
+      if (!map.empty()) {
+        REXSYS_WARN("REX_WATCH_MEM pages written in the last second:{}", map);
+        for (size_t i = 0; i < writer_runs.size(); ++i) {
+          REXSYS_WARN("REX_WATCH_MEM   writer #{} wrote:{}", i, writer_runs[i]);
+        }
+        if (dropped) {
+          REXSYS_WARN("REX_WATCH_MEM   {} further faults from writers beyond the per-second budget",
+                      dropped);
+        }
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(250));
+  }
 }
 
 uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
@@ -1084,9 +1263,12 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     uint32_t state = page_table_[page_number].state;
     if ((allocation_type == memory::kMemoryAllocationReserve) && state) {
       // Already reserved.
-      REXSYS_ERROR(
+      REXSYS_DEBUG(
           "BaseHeap::AllocFixed attempting to reserve an already reserved "
-          "range");
+          "range: base={:08X} size={:X} align={:X} page={} of [{}..{}] state={:X} "
+          "protect={:X} heap={:08X}-{:08X} page_size={:X}",
+          base_address, size, alignment, page_number, start_page_number, end_page_number,
+          state, protect, heap_base_, heap_base_ + (heap_size_ - 1), page_size_);
       return false;
     }
     if ((allocation_type == memory::kMemoryAllocationCommit) &&
@@ -1777,6 +1959,25 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   return BaseHeap::Protect(address, size, protect);
 }
 
+rex::memory::PageAccess BaseHeap::QueryPageAccessUnlocked(uint32_t address) const {
+  if (address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return rex::memory::PageAccess::kNoAccess;
+  }
+  const PageEntry& entry = page_table_[(address - heap_base_) >> page_size_shift_];
+  return entry.state ? ToPageAccess(entry.current_protect) : rex::memory::PageAccess::kNoAccess;
+}
+
+rex::memory::PageAccess PhysicalHeap::GuestAccessForSystemPage(uint32_t system_page) const {
+  uint32_t heap_relative_address =
+      rex::sat_sub(system_page * system_page_size_, host_address_offset());
+  const PageEntry& view_entry = page_table_[heap_relative_address >> page_size_shift_];
+  if (view_entry.state) {
+    return ToPageAccess(view_entry.current_protect);
+  }
+  return parent_heap_->QueryPageAccessUnlocked(GetPhysicalAddress(heap_base_) +
+                                               heap_relative_address);
+}
+
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                                          bool enable_invalidation_notifications,
                                          bool enable_data_providers) {
@@ -1840,10 +2041,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     // polled for the last time without releasing the lock.
     SystemPageFlagsBlock& page_flags_block = system_page_flags_[i >> 6];
     uint64_t page_flags_bit = uint64_t(1) << (i & 63);
-    uint32_t guest_page_number =
-        rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
-    rex::memory::PageAccess current_page_access =
-        ToPageAccess(page_table_[guest_page_number].current_protect);
+    rex::memory::PageAccess current_page_access = GuestAccessForSystemPage(i);
     bool protect_system_page = false;
     // Don't do anything with inaccessible pages - don't protect, don't enable
     // callbacks - because real access violations are needed there. And don't
@@ -1996,10 +2194,13 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       bool unprotect_page =
           (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
       if (unprotect_page) {
+        // Only a protection the guest asked for in this view is kept. An alias
+        // allocated through another view has no guest protection of its own.
         uint32_t guest_page_number =
             rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
-        if (ToPageAccess(page_table_[guest_page_number].current_protect) !=
-            rex::memory::PageAccess::kReadWrite) {
+        const PageEntry& view_entry = page_table_[guest_page_number];
+        if (view_entry.state &&
+            ToPageAccess(view_entry.current_protect) != rex::memory::PageAccess::kReadWrite) {
           unprotect_page = false;
         }
       }

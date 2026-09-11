@@ -349,9 +349,8 @@ TEST_CASE("MigrationScan: ScanLegacyIdentifiers warns on tokens with no replacem
 TEST_CASE("MigrationScan: ScanLegacyIdentifiers respects identifier boundaries",
           "[rexglue][migration_scan]") {
   TempProject tp("migration_legacy_idents_boundary");
-  // PPC_FUNC_PROLOGUE is a known token; PPC_FUNC_THINGAMAJIG is not. The token
-  // matcher must prefer the longest run of identifier characters and only
-  // rewrite when the full identifier is in the rule table.
+  // The token matcher must prefer the longest run of identifier characters and
+  // only rewrite when the full identifier is in the rule table.
   tp.writeFile("src/bar.cpp",
                "PPC_FUNC_PROLOGUE();\n"
                "PPC_FUNC_THINGAMAJIG();\n");

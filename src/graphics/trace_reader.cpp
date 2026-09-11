@@ -21,7 +21,7 @@
 #include <rex/memory/mapped_memory.h>
 #include <rex/platform.h>
 
-#include <snappy.h"
+#include <snappy.h>
 
 namespace rex::graphics {
 
@@ -229,6 +229,13 @@ void TraceReader::ParseTrace() {
     current_frame.end_ptr = trace_ptr;
     frames_.push_back(std::move(current_frame));
   }
+}
+
+bool TraceReader::DecodeMemory(const MemoryCommand* command, std::vector<uint8_t>& out) {
+  out.resize(command->decoded_length);
+  return DecompressMemory(command->encoding_format,
+                          reinterpret_cast<const uint8_t*>(command) + sizeof(*command),
+                          command->encoded_length, out.data(), out.size());
 }
 
 bool TraceReader::DecompressMemory(MemoryEncodingFormat encoding_format, const void* src,

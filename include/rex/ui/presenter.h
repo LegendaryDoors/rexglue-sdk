@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -362,6 +363,12 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  // Captures what the window shows, overlays included, by reading back the
+  // swapchain image of the next paint. Must not be called from a paint thread.
+  virtual bool CaptureHostOutput(RawImage& image_out) {
+    (void)image_out;
+    return false;
+  }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
@@ -375,6 +382,10 @@ class Presenter {
   void RequestUIPaintFromUIThread();
 
  protected:
+  // Asks the UI thread to paint. Callable from any thread; false when the
+  // presenter is not attached to a window with a surface.
+  bool RequestUIThreadPaintFromAnyThread();
+
   enum class PaintResult {
     kPresented,
     kPresentedSuboptimal,
@@ -1050,6 +1061,14 @@ class Presenter {
   std::condition_variable dxgi_ui_tick_signal_condition_;
 
   std::thread dxgi_ui_tick_thread_;
+#else
+  // Without a vertical blank to wait for, UI-only paints are paced to the
+  // display refresh rate by time. Interruptible, so guest frames never queue.
+  std::mutex ui_tick_mutex_;
+  std::condition_variable ui_tick_condition_;
+  bool ui_tick_force_requested_ = false;
+  // Accessible only from the UI thread.
+  std::chrono::steady_clock::time_point ui_tick_last_ = {};
 #endif  // XE_PLATFORM
 };
 

@@ -130,6 +130,11 @@ WindowSDL::~WindowSDL() {
 bool WindowSDL::OpenImpl() {
   // SDL window coordinates are physical pixels on Windows and X11.
   SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
+  if (REXCVAR_GET(start_minimized)) {
+    // The window is created hidden, so SDL records this as a pending flag and
+    // issues the real minimize request when SDL_ShowWindow maps the window.
+    flags |= SDL_WINDOW_MINIMIZED;
+  }
   sdl_window_ = SDL_CreateWindow(GetTitle().c_str(), int(SizeToPhysical(GetDesiredLogicalWidth())),
                                  int(SizeToPhysical(GetDesiredLogicalHeight())), flags);
   if (!sdl_window_) {
@@ -165,6 +170,13 @@ bool WindowSDL::OpenImpl() {
   SDL_StartTextInput(sdl_window_);
   ApplyCursorVisibilityNow();
   SDL_ShowWindow(sdl_window_);
+  REXLOG_INFO("[window] opened {}x{} {}", GetDesiredLogicalWidth(), GetDesiredLogicalHeight(),
+              IsFullscreen() ? "fullscreen" : "windowed");
+  if (REXCVAR_GET(start_minimized)) {
+    // Minimize is a request the window manager may refuse, and refusal cannot
+    // be queried here. SDL_EVENT_WINDOW_MINIMIZED is the confirmation.
+    REXLOG_INFO("[window] start_minimized: minimize requested at open");
+  }
 
   // Actualize state for the common Window code. Listener dispatch is handled
   // by Window::Open after OpenImpl returns; these only record initial state.
@@ -180,6 +192,15 @@ bool WindowSDL::OpenImpl() {
     OnFocusUpdate(true, destruction_receiver);
   }
   return true;
+}
+
+float WindowSDL::GetDisplayRefreshRate() const {
+  if (!sdl_window_) {
+    return 0.0f;
+  }
+  const SDL_DisplayID display = SDL_GetDisplayForWindow(sdl_window_);
+  const SDL_DisplayMode* mode = display ? SDL_GetCurrentDisplayMode(display) : nullptr;
+  return mode ? mode->refresh_rate : 0.0f;
 }
 
 void WindowSDL::RequestCloseImpl() {
@@ -380,9 +401,13 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
       OnPaint(true);
       break;
     case SDL_EVENT_WINDOW_MINIMIZED:
+      // Logged so unattended runs (--start_minimized) have ground truth for
+      // whether the window manager honoured the minimize request.
+      REXLOG_INFO("[window] minimized (window manager confirmed)");
       OnMinimized(destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_RESTORED:
+      REXLOG_INFO("[window] restored");
       OnRestored(destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:

@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -242,6 +243,10 @@ class VulkanCommandProcessor : public CommandProcessor {
                                     bool keep_dynamic_blend_constants = false,
                                     bool keep_dynamic_stencil_mask_ref = false);
   void BindExternalComputePipeline(VkPipeline pipeline);
+  // Writes the 1x image of a resolution-scaled resolve into the shared memory
+  // buffer, within the destination rectangle only. Returns whether it ran.
+  bool DownscaleResolveToSharedMemory(const draw_util::ResolveInfo& resolve_info,
+                                      uint32_t extent_start, uint32_t extent_length);
   void SetViewport(const VkViewport& viewport);
   void SetScissor(const VkRect2D& scissor);
 
@@ -449,17 +454,47 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
+  // Ring depth for resolve readbacks, since a title may resolve into one
+  // destination several times per frame. Slots are allocated on first use.
+  static constexpr uint32_t kReadbackSlots = 8;
   struct ReadbackBuffer {
-    VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    void* mapped_data[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
-    uint64_t submission_written[2] = {0, 0};
-    uint32_t written_size[2] = {0, 0};
+    VkBuffer buffers[kReadbackSlots] = {};
+    VkDeviceMemory memories[kReadbackSlots] = {};
+    void* mapped_data[kReadbackSlots] = {};
+    uint32_t sizes[kReadbackSlots] = {};
+    uint64_t submission_written[kReadbackSlots] = {};
+    uint32_t written_size[kReadbackSlots] = {};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+  // A resolve copied into a ring slot whose bytes are still to be installed
+  // into guest memory: done once its submission has completed.
+  struct PendingReadbackInstall {
+    uint64_t resolve_key;
+    uint32_t slot;
+    uint64_t submission;
+    uint32_t written_address;
+    uint32_t written_length;
+    bool is_scaled;
+    draw_util::ResolveInfo resolve_info;
+  };
+  // A guest fence store held until every readback recorded before it landed.
+  struct DeferredFenceWrite {
+    uint64_t submission;
+    uint32_t address;
+    uint32_t value;
+    std::chrono::steady_clock::time_point deferred_at;
+  };
+  void InstallReadbackSlot(const ReadbackBuffer& readback, uint32_t slot, uint32_t written_address,
+                           uint32_t written_length, bool is_scaled,
+                           const draw_util::ResolveInfo& resolve_info, bool is_synchronous);
+  // Installs the pending readbacks whose submissions have completed and
+  // performs the fence stores they were holding; with await, waits for all.
+  void ProcessCompletedReadbacks(bool await);
+  bool DeferGuestFenceWrite(uint32_t address, uint32_t value) override;
+  void PrepareForWait() override;
+  void OnIdleSpin() override;
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
@@ -483,9 +518,18 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t scale_x;
     uint32_t scale_y;
     uint32_t pixel_size_log2;
-    uint32_t tile_count;
-    uint32_t source_offset_bytes;
     uint32_t half_pixel_offset;
+    uint32_t rect_left;
+    uint32_t rect_top;
+    uint32_t rect_width;
+    uint32_t rect_height;
+    uint32_t dest_pitch;
+    uint32_t dest_height;
+    uint32_t dest_slice;
+    uint32_t extent_offset_bytes;
+    uint32_t extent_length_bytes;
+    uint32_t source_offset_bytes;
+    uint32_t dest_offset_bytes;
   };
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
   void DestroySwapFxaaSourceImage();
@@ -541,6 +585,19 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
+  // Diagnostic counters for the async-placeholder path: how many draws were
+  // dropped, so an empty frame can be told from a slightly incomplete one.
+  uint32_t frame_async_placeholder_draws_ = 0;   // dropped draws, this frame
+  uint64_t total_async_placeholder_draws_ = 0;   // dropped draws, all frames
+  uint64_t total_async_skipped_frames_ = 0;      // frames never presented
+
+  // Per-frame census of the render state the FSI path handles per sample: MSAA
+  // mode, colour render target format and alpha-to-mask. Logged on change.
+  uint32_t frame_msaa_mask_ = 0;            // bit per xenos::MsaaSamples value
+  uint32_t frame_color_format_mask_ = 0;    // bit per ColorRenderTargetFormat
+  uint32_t frame_alpha_to_mask_draws_ = 0;  // draws with alpha-to-mask enabled
+  uint32_t frame_state_draws_ = 0;          // draws counted into the above
+  uint64_t last_logged_draw_state_ = UINT64_MAX;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
@@ -694,9 +751,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
-  VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory resolve_downscale_buffer_memory_ = VK_NULL_HANDLE;
-  uint32_t resolve_downscale_buffer_size_ = 0;
 
   VkImage swap_fxaa_source_image_ = VK_NULL_HANDLE;
   VkDeviceMemory swap_fxaa_source_image_memory_ = VK_NULL_HANDLE;
@@ -755,6 +809,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+  std::vector<PendingReadbackInstall> pending_readback_installs_;
+  std::vector<DeferredFenceWrite> deferred_fence_writes_;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

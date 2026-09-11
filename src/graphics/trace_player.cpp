@@ -54,6 +54,11 @@ void TracePlayer::SeekFrame(int target_frame) {
             false);
 }
 
+void TracePlayer::SeekFrameStart(int target_frame) {
+  current_frame_index_ = target_frame;
+  current_command_index_ = -1;
+}
+
 void TracePlayer::SeekCommand(int target_command) {
   if (current_command_index_ == target_command) {
     return;
@@ -104,8 +109,11 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
   playing_trace_ = true;
   auto trace_ptr = trace_data;
   bool pending_break = false;
+  // Set when a swap ends playback early. This must unwind through the bottom
+  // of the function: playback_event_ is signalled in exactly one place.
+  bool stop_playback = false;
   const PacketStartCommand* pending_packet = nullptr;
-  while (trace_ptr < trace_data + trace_size) {
+  while (!stop_playback && trace_ptr < trace_data + trace_size) {
     playback_percent_ =
         uint32_t((float(trace_ptr - trace_data) / float(trace_end - trace_data)) * 10000);
 
@@ -151,8 +159,7 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
           pending_packet = nullptr;
         }
         if (pending_break) {
-          playing_trace_ = false;
-          return;
+          stop_playback = true;
         }
         break;
       }

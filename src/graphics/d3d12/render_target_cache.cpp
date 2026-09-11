@@ -5350,7 +5350,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramBaseTilesBits),
            dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
            dxbc::Src::CB(kDumpCbufferOffsets, kDumpCbufferOffsets, 0, dxbc::Src::kXXXX));
-  // Get the linear tile index within the source texture to r0.w.
+  // Linear tile index within the source texture, to r0.w. The subtraction is
+  // modulo the EDRAM tile count: a claim can wrap past the end of EDRAM.
   // r0.x = X sample position within the tile
   // r0.y = Y sample position within the tile
   // r0.z = sample offset in the EDRAM
@@ -5358,6 +5359,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r1.x = free
   a.OpIAdd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
            -dxbc::Src::R(1, dxbc::Src::kXXXX));
+  a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
+          dxbc::Src::LU(xenos::kEdramTileCount - 1));
   // Get the source texture pitch in tiles to r1.x.
   // r0.x = X sample position within the tile
   // r0.y = Y sample position within the tile

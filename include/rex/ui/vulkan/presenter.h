@@ -129,6 +129,7 @@ class VulkanPresenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  bool CaptureHostOutput(RawImage& image_out) override;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -281,7 +282,6 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -292,7 +292,8 @@ class VulkanPresenter final : public Presenter {
 
       const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
+      // No present semaphore here on purpose - see
+      // PaintContext::swapchain_present_semaphores.
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -353,7 +354,7 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        bool& ui_surface_unusable_out, bool& image_transfer_src_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -414,8 +415,14 @@ class VulkanPresenter final : public Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    // Whether the surface allowed the images to be transfer sources, which
+    // reading them back for a host output capture needs.
+    bool swapchain_transfer_src = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+    // The semaphore vkQueuePresentKHR waits on must be owned by the swapchain
+    // image: it stays in use until vkAcquireNextImageKHR hands that image back.
+    std::vector<VkSemaphore> swapchain_present_semaphores;
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
@@ -480,6 +487,32 @@ class VulkanPresenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+
+  // Host output capture. A caller posts its request and waits; the next paint
+  // copies its swapchain image into a readback buffer. One at a time.
+  struct HostCapturePaint {
+    // Whether this paint took the pending request (and thus must complete it).
+    bool taken = false;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkExtent2D extent = {};
+    VkFormat format = VK_FORMAT_UNDEFINED;
+  };
+  // Called by the paint between the end of the render pass and the end of the
+  // command buffer, and records the copy for any pending request.
+  void RecordHostCapture(VkCommandBuffer command_buffer, VkImage swapchain_image,
+                         HostCapturePaint& paint);
+  // Called by the paint after presenting (or after failing to submit). Reads
+  // the copy back and completes the request.
+  void FinishHostCapture(HostCapturePaint& paint, bool submitted, uint64_t submission_index);
+  static bool ConvertSwapchainPixelsToRawImage(VkFormat format, const uint32_t* pixels,
+                                               VkExtent2D extent, RawImage& image_out);
+  std::mutex host_capture_mutex_;
+  std::condition_variable host_capture_cv_;
+  RawImage* host_capture_image_ = nullptr;
+  bool host_capture_in_progress_ = false;
+  bool host_capture_completed_ = false;
+  bool host_capture_succeeded_ = false;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

@@ -105,10 +105,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
-  // frame for calling.
+  // frame for calling. resolve_info_out, if provided, receives the resolve
+  // parameters, including the exact destination rectangle.
   bool Resolve(const memory::Memory& memory, VulkanSharedMemory& shared_memory,
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out);
+               uint32_t& written_length_out,
+               draw_util::ResolveInfo* resolve_info_out = nullptr);
 
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();

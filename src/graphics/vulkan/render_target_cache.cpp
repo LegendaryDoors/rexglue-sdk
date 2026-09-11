@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <tuple>
@@ -23,10 +24,12 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/diagnostic_gate.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -1217,6 +1220,19 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
     }
 
     trace_writer_.WriteEdramSnapshot(edram_snapshot_download_mapping);
+    // REX_DUMP_EDRAM=<path> writes the raw 10 MiB EDRAM contents whenever this
+    // download runs. Costs nothing when the variable is unset.
+    if (const char* edram_dump_path = getenv("REX_DUMP_EDRAM")) {
+      FILE* edram_dump_file = fopen(edram_dump_path, "wb");
+      if (edram_dump_file) {
+        fwrite(edram_snapshot_download_mapping, 1, xenos::kEdramSizeBytes, edram_dump_file);
+        fclose(edram_dump_file);
+        REXGPU_INFO("REX_DUMP_EDRAM: wrote {} bytes to {}", xenos::kEdramSizeBytes,
+                    edram_dump_path);
+      } else {
+        REXGPU_ERROR("REX_DUMP_EDRAM: cannot open {} for writing", edram_dump_path);
+      }
+    }
     dfn.vkUnmapMemory(device, edram_snapshot_download_buffer_memory_);
   } else {
     REXGPU_ERROR(
@@ -1331,7 +1347,8 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
 bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       VulkanSharedMemory& shared_memory,
                                       VulkanTextureCache& texture_cache,
-                                      uint32_t& written_address_out, uint32_t& written_length_out) {
+                                      uint32_t& written_address_out, uint32_t& written_length_out,
+                                      draw_util::ResolveInfo* resolve_info_out) {
   written_address_out = 0;
   written_length_out = 0;
 
@@ -1342,6 +1359,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
                                  IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
     return false;
+  }
+  if (resolve_info_out) {
+    *resolve_info_out = resolve_info;
   }
 
   // Nothing to copy/clear.
@@ -1489,9 +1509,55 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           command_processor_.SubmitBarriers(true);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
 
-          // Invalidate textures and mark the range as scaled if needed.
-          texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+          // At draw resolution scale the copy wrote only the scaled resolve
+          // buffer, so produce the 1x image in shared memory from it as well.
+          bool shared_memory_copy_written = false;
+          if (draw_resolution_scaled) {
+            shared_memory_copy_written = command_processor_.DownscaleResolveToSharedMemory(
+                resolve_info, resolve_info.copy_dest_extent_start,
+                resolve_info.copy_dest_extent_length);
+          }
+
+          // Mark only what the destination rectangle can touch, per 32-row tile
+          // band: the full extent spans tiles the resolve does not write.
+          {
+            const FormatInfo* mark_format_info =
+                FormatInfo::Get(uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+            uint32_t mark_bpp_log2 = rex::log2_floor(mark_format_info->bits_per_pixel >> 3);
+            uint32_t mark_x0 = uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8)
+                               << 3;
+            uint32_t mark_y0 = uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8)
+                               << 3;
+            uint32_t mark_x1 = mark_x0 + (uint32_t(resolve_info.coordinate_info.width_div_8) << 3);
+            uint32_t mark_y1 = mark_y0 + (resolve_info.height_div_8 << 3);
+            uint32_t mark_pitch =
+                uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5;
+            uint32_t mark_height =
+                uint32_t(resolve_info.copy_dest_coordinate_info.height_aligned_div_32) << 5;
+            bool mark_3d = resolve_info.copy_dest_info.copy_dest_array != 0;
+            uint32_t mark_slice = resolve_info.copy_dest_info.copy_dest_slice;
+            for (uint32_t mark_y = mark_y0; mark_y < mark_y1; mark_y = (mark_y | 31) + 1) {
+              uint32_t mark_band_bottom = std::min(mark_y1, (mark_y | 31) + 1);
+              uint32_t mark_lower, mark_upper;
+              if (mark_3d) {
+                mark_lower = texture_util::GetTiledAddressLowerBound3D(
+                    mark_x0, mark_y, mark_slice, mark_pitch, mark_height, mark_bpp_log2);
+                mark_upper = texture_util::GetTiledAddressUpperBound3D(
+                    mark_x1, mark_band_bottom, mark_slice + 1, mark_pitch, mark_height,
+                    mark_bpp_log2);
+              } else {
+                mark_lower = texture_util::GetTiledAddressLowerBound2D(mark_x0, mark_y, mark_pitch,
+                                                                       mark_bpp_log2);
+                mark_upper = texture_util::GetTiledAddressUpperBound2D(mark_x1, mark_band_bottom,
+                                                                       mark_pitch, mark_bpp_log2);
+              }
+              if (mark_upper > mark_lower) {
+                texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_base + mark_lower,
+                                                  mark_upper - mark_lower,
+                                                  shared_memory_copy_written);
+              }
+            }
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -3908,6 +3974,11 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
           }
         } break;
       }
+    } else if (mode.output == TransferOutput::kStencilBit) {
+      // Depth/stencil source to a stencil bit: only the stencil is available,
+      // as the depth texture is not bound, so `packed` must be assigned here.
+      assert_true(source_stencil[0] != spv::NoResult);
+      packed = source_stencil[0];
     } else if (source_depth_float[0] != spv::NoResult) {
       if (mode.output == TransferOutput::kDepth && dest_depth_format == source_depth_format) {
         builder.createStore(source_depth_float[0], output_fragment_depth);
@@ -4761,6 +4832,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
+  // Companion of the REX_LOG_OWNERSHIP claim log: whether each recorded
+  // transfer is executed here, and the reason when a destination is dropped.
+  static const bool log_ownership_set = std::getenv("REX_LOG_OWNERSHIP") != nullptr;
+  const bool log_ownership = log_ownership_set && rex::graphics::diag::LogGateOpen();
+
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
@@ -5025,6 +5101,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     }
     VkRenderPass transfer_render_pass = GetHostRenderTargetsRenderPass(transfer_render_pass_key);
     if (transfer_render_pass == VK_NULL_HANDLE) {
+      if (log_ownership && !current_transfers.empty()) {
+        REXGPU_INFO("OWNLOG XFER-DROP dest=[{}] transfers={} reason=no_render_pass",
+                    dest_rt_key.GetDebugName(), current_transfers.size());
+      }
       continue;
     }
     const RenderTarget* transfer_framebuffer_render_targets[1 + xenos::kMaxColorRenderTargets] = {};
@@ -5033,6 +5113,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         GetHostRenderTargetsFramebuffer(transfer_render_pass_key, dest_rt_key.pitch_tiles_at_32bpp,
                                         transfer_framebuffer_render_targets);
     if (!transfer_framebuffer) {
+      if (log_ownership && !current_transfers.empty()) {
+        REXGPU_INFO("OWNLOG XFER-DROP dest=[{}] transfers={} reason=no_framebuffer",
+                    dest_rt_key.GetDebugName(), current_transfers.size());
+      }
       continue;
     }
     // Don't enter the render pass immediately - may still insert source
@@ -5266,6 +5350,13 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         bool transfer_is_stencil_bit = (transfer_pipeline_layout_info.used_push_constant_dwords &
                                         kTransferUsedPushConstantDwordStencilMaskBit) != 0;
 
+        if (log_ownership) {
+          REXGPU_INFO("OWNLOG XFER dest=[{}] src=[{}] tiles=[{},{}) rects={} mode={}",
+                      dest_rt_key.GetDebugName(), source_vulkan_rt.key().GetDebugName(),
+                      it_merged_first->transfer.start_tiles, it_merged_last->transfer.end_tiles,
+                      transfer_rectangle_count, uint32_t(transfer_shader_key.mode));
+        }
+
         uint32_t transfer_vertex_count = 6 * transfer_rectangle_count;
         VkBuffer transfer_vertex_buffer;
         VkDeviceSize transfer_vertex_buffer_offset;
@@ -5274,6 +5365,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                 current_submission, sizeof(float) * 2 * transfer_vertex_count, sizeof(float),
                 transfer_vertex_buffer, transfer_vertex_buffer_offset));
         if (!transfer_rectangle_write_ptr) {
+          if (log_ownership) {
+            REXGPU_INFO("OWNLOG XFER-DROP dest=[{}] transfers=1 reason=no_vertex_buffer",
+                        dest_rt_key.GetDebugName());
+          }
           continue;
         }
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
@@ -5328,6 +5423,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         const VkPipeline* transfer_pipelines = GetTransferPipelines(
             TransferPipelineKey(transfer_render_pass_key, transfer_shader_key));
         if (!transfer_pipelines) {
+          if (log_ownership) {
+            REXGPU_INFO("OWNLOG XFER-DROP dest=[{}] transfers=1 reason=no_pipeline",
+                        dest_rt_key.GetDebugName());
+          }
           continue;
         }
         command_processor_.BindExternalGraphicsPipeline(transfer_pipelines[0]);
@@ -5803,12 +5902,16 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
                 builder.makeIntConstant(-int32_t(tile_width_half)))));
   }
 
-  // Get the linear tile index within the source texture.
+  // Linear tile index within the source texture. The subtraction is modulo the
+  // EDRAM tile count: a source can own tiles below its base through wrap.
   spv::Id source_tile_index = builder.createBinOp(
-      spv::OpISub, type_uint, edram_tile_index_non_wrapped,
-      builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
-                          const_edram_base_tiles_bits_plus_1,
-                          builder.makeUintConstant(xenos::kEdramBaseTilesBits)));
+      spv::OpBitwiseAnd, type_uint,
+      builder.createBinOp(
+          spv::OpISub, type_uint, edram_tile_index_non_wrapped,
+          builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
+                              const_edram_base_tiles_bits_plus_1,
+                              builder.makeUintConstant(xenos::kEdramBaseTilesBits))),
+      builder.makeUintConstant(xenos::kEdramTileCount - 1));
   // Split the linear tile index in the source texture into X and Y in tiles.
   spv::Id source_pitch_tiles =
       builder.createTriOp(spv::OpBitFieldUExtract, type_uint, pitches_constant,
@@ -6229,6 +6332,19 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  dump_rectangles_);
+  // Companion of the REX_LOG_OWNERSHIP claim log: which render target each
+  // resolve or dump reads each tile-row range from.
+  static const bool log_ownership_set = std::getenv("REX_LOG_OWNERSHIP") != nullptr;
+  const bool log_ownership = log_ownership_set && rex::graphics::diag::LogGateOpen();
+  if (log_ownership) {
+    REXGPU_INFO("OWNLOG DUMP base={} row_len={} rows={} pitch={} rects={}", dump_base,
+                dump_row_length_used, dump_rows, dump_pitch, dump_rectangles_.size());
+    for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+      REXGPU_INFO("OWNLOG DUMP-RECT from=[{}] row_first={} rows={} row_span=[{},{})",
+                  rectangle.render_target->key().GetDebugName(), rectangle.row_first,
+                  rectangle.rows, rectangle.row_first_start, rectangle.row_last_end);
+    }
+  }
   if (dump_rectangles_.empty()) {
     return true;
   }

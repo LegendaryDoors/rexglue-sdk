@@ -108,14 +108,15 @@ u32 ConvertFiberToThread_impl(XThread* thread) {
 
   auto* info = ks->LookupFiber(fiber_addr);
   if (info) {
-    info->host_fiber->Destroy();
+    // Do not destroy the thread's own main fiber: it is the running execution
+    // context, and freeing it leaves the next switch nothing to save into.
+    if (info->host_fiber && info->host_fiber != thread->main_fiber()) {
+      info->host_fiber->Destroy();
+    }
     ks->UnregisterFiber(fiber_addr);
   }
 
   kthread->fiber_ptr = 0u;
-  // Must null main_fiber_ AFTER Destroy() above to avoid double-free
-  // in ~XThread, which also calls main_fiber_->Destroy() if non-null.
-  thread->set_main_fiber(nullptr);
   mem->SystemHeapFree(fiber_addr);
 
   return 1;  // TRUE
@@ -233,8 +234,12 @@ u32 CreateFiber_entry(u32 dwStackSize, u32 lpStartAddress, mapped_void lpParamet
   fiber->sp_save = initial_sp;
 
   // Create host fiber
-  size_t host_stack =
-      std::max(static_cast<size_t>(guest_stack_size), static_cast<size_t>(256u * 1024u));
+  // The host fiber runs recompiled code, SDK code and driver calls, none of
+  // which respect the guest's stack size. REX_FIBER_STACK_KB overrides it.
+  static const char* stack_kb_env = getenv("REX_FIBER_STACK_KB");
+  static const size_t host_stack_floor =
+      stack_kb_env ? size_t(strtoul(stack_kb_env, nullptr, 10)) * 1024u : size_t(256u * 1024u);
+  size_t host_stack = std::max(static_cast<size_t>(guest_stack_size), host_stack_floor);
   auto args_owner = std::make_unique<FiberEntryArgs>(FiberEntryArgs{
       start_fn,
       buf_addr,
@@ -290,6 +295,16 @@ void SwitchToFiber_entry(mapped_void lpFiber) {
   auto* mem = ks->memory();
   auto [kthread, pcr, ctx, _mem] = GetGuestThreadPtrs(thread);
   uint32_t target_addr = lpFiber.guest_address();
+
+  // Diagnostic: a thread reaching here with Fiber::Current() null never went
+  // through XThread::Execute, so it is guest code on a plain host thread.
+  if (!rex::thread::Fiber::Current()) {
+    REXKRNL_ERROR(
+        "SwitchToFiber with no host fiber context: thread='{}' handle={:#x} main_fiber={} "
+        "target={:#010x} kthread_fiber_ptr={:#010x}",
+        thread->name(), thread->handle(), static_cast<const void*>(thread->main_fiber()),
+        target_addr, uint32_t(kthread->fiber_ptr));
+  }
 
   // Validate target
   auto* target_info = ks->LookupFiber(target_addr);

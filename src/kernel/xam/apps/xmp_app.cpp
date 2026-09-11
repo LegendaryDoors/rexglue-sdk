@@ -415,6 +415,21 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       return X_E_SUCCESS;
     }
+    case 0x00070025: {
+      // Builds the XMP side of a title playlist enumerator. A host has no
+      // custom soundtrack, so the correct result is an empty enumerator.
+      struct {
+        rex::be<uint32_t> xmp_client;
+        rex::be<uint32_t> unk_1;
+        rex::be<uint32_t> scratch_ptr;
+      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+      static_assert_size(decltype(*args), 12);
+
+      REXKRNL_DEBUG("XMPCreateTitlePlaylistEnumerator({:08X}, {:08X}, {:08X}) -> 0 entries",
+                    uint32_t(args->xmp_client), uint32_t(args->unk_1),
+                    uint32_t(args->scratch_ptr));
+      return X_E_SUCCESS;
+    }
     case 0x00070029: {
       // XMPGetPlaybackBehavior
       assert_true(!buffer_length || buffer_length == 16);

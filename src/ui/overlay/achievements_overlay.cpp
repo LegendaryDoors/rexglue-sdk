@@ -28,7 +28,7 @@ AchievementsOverlayDialog::AchievementsOverlayDialog(ImGuiDrawer* imgui_drawer,
 AchievementsOverlayDialog::~AchievementsOverlayDialog() {}
 
 namespace {
-// Palette — kept ASCII-only; the bundled overlay font has no em dash / check glyphs.
+// Palette, kept ASCII-only: the bundled overlay font has no dash or check glyphs.
 constexpr ImVec4 kUnlockedTitle{0.45f, 1.00f, 0.55f, 1.00f};  // bright green
 constexpr ImVec4 kUnlockedDesc{0.70f, 0.85f, 0.72f, 1.00f};   // soft green
 constexpr ImVec4 kLockedTitle{0.78f, 0.80f, 0.84f, 1.00f};    // light grey

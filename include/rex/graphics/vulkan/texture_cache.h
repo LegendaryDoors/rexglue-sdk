@@ -350,6 +350,16 @@ class VulkanTextureCache final : public TextureCache {
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
 
+  // REX_DUMP_TEXTURE_BASE=<hex guest address> captures the load shader's
+  // converted output for that texture, written to REX_DUMP_TEXTURE_PATH.
+  VkBuffer texture_dump_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory texture_dump_buffer_memory_ = VK_NULL_HANDLE;
+  VkDeviceSize texture_dump_buffer_size_ = 0;
+  uint32_t texture_dump_row_pitch_blocks_ = 0;
+  uint32_t texture_dump_bytes_per_block_ = 0;
+  uint32_t texture_dump_width_ = 0;
+  uint32_t texture_dump_height_ = 0;
+
   // If both images can be placed in the same allocation, it's one allocation,
   // otherwise it's two separate.
   std::array<VkDeviceMemory, 2> null_images_memory_{};

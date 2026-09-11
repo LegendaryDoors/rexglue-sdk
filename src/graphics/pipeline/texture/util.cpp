@@ -414,7 +414,13 @@ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
       layout.mip_offsets_bytes[level] = mip_offset_bytes;
       layout.mips_total_extent_bytes = std::max(
           layout.mips_total_extent_bytes, mip_offset_bytes + level_layout.level_data_extent_bytes);
-      mip_offset_bytes += level_layout.array_slice_stride_bytes * layout.array_size;
+      // A tiled stacked texture with more than one slice pads each mip level's
+      // slice count to the tile depth, so a 6-slice texture mips at 8 strides.
+      uint32_t stored_array_size = layout.array_size;
+      if (dimension == xenos::DataDimension::k2DOrStacked && is_tiled && layout.array_size > 1) {
+        stored_array_size = rex::align(layout.array_size, xenos::kTextureTileDepth);
+      }
+      mip_offset_bytes += level_layout.array_slice_stride_bytes * stored_array_size;
     }
   }
 

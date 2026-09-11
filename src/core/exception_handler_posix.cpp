@@ -15,6 +15,7 @@
 
 #include <signal.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 
@@ -24,8 +25,48 @@
 #include <rex/platform.h>
 
 #include <ucontext.h>
+#include <unistd.h>
 
 namespace rex::arch {
+
+namespace {
+
+// Reporting helpers for the unhandled-exception path below. These run inside a
+// signal handler, so they must be async-signal-safe.
+void SafeWrite(const char* s, size_t length) {
+  while (length) {
+    ssize_t written = write(STDERR_FILENO, s, length);
+    if (written <= 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return;
+    }
+    s += written;
+    length -= size_t(written);
+  }
+}
+
+void SafeWriteString(const char* s) {
+  SafeWrite(s, std::strlen(s));
+}
+
+void SafeWriteHex(uint64_t value) {
+  static const char kHexDigits[] = "0123456789ABCDEF";
+  char buffer[18] = {'0', 'x'};
+  size_t i = 2;
+  bool started = false;
+  for (int shift = 60; shift >= 0; shift -= 4) {
+    const unsigned digit = unsigned((value >> shift) & 0xF);
+    if (digit || started || shift == 0) {
+      buffer[i++] = kHexDigits[digit];
+      started = true;
+    }
+  }
+  SafeWrite(buffer, i);
+}
+
+}  // namespace
 
 bool signal_handlers_installed_ = false;
 struct sigaction original_sigill_handler_;
@@ -205,6 +246,59 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // Nothing claimed the exception. Returning would re-execute the faulting
+  // instruction forever, so report it and let the process die with a core.
+  SafeWriteString("\n[rex] FATAL: unhandled ");
+  switch (signal_number) {
+    case SIGSEGV:
+      SafeWriteString("SIGSEGV");
+      break;
+    case SIGILL:
+      SafeWriteString("SIGILL");
+      break;
+    default:
+      SafeWriteString("signal ");
+      SafeWriteHex(uint64_t(signal_number));
+      break;
+  }
+  SafeWriteString(" - no installed handler claimed it.\n[rex]   fault address = ");
+  SafeWriteHex(uint64_t(reinterpret_cast<uintptr_t>(signal_info->si_addr)));
+  SafeWriteString("\n[rex]   host pc       = ");
+#if REX_ARCH_AMD64
+  SafeWriteHex(thread_context.rip);
+#elif REX_ARCH_ARM64
+  SafeWriteHex(thread_context.pc);
+#endif  // REX_ARCH
+  SafeWriteString(
+      "\n[rex] Guest address = fault address - guest membase (see the"
+      " xenia_memory\n[rex] mapping in /proc/<pid>/maps). Terminating.\n");
+
+  // Chain to whatever was installed before us. If the previous disposition was
+  // the default, restore it and return so the kernel terminates us.
+  struct sigaction* original = nullptr;
+  if (signal_number == SIGILL) {
+    original = &original_sigill_handler_;
+  } else if (signal_number == SIGSEGV) {
+    original = &original_sigsegv_handler_;
+  }
+
+  if (original) {
+    if ((original->sa_flags & SA_SIGINFO) && original->sa_sigaction) {
+      original->sa_sigaction(signal_number, signal_info, signal_context);
+      return;
+    }
+    if (original->sa_handler != SIG_DFL && original->sa_handler != SIG_IGN) {
+      original->sa_handler(signal_number);
+      return;
+    }
+  }
+
+  struct sigaction default_action;
+  std::memset(&default_action, 0, sizeof(default_action));
+  default_action.sa_handler = SIG_DFL;
+  sigemptyset(&default_action.sa_mask);
+  sigaction(signal_number, &default_action, nullptr);
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {

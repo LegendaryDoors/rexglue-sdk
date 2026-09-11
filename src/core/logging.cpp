@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cstdio>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -72,7 +73,14 @@ LogConfig g_config;
 
 std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
                                             std::string_view app_name) {
-  std::filesystem::create_directories(logs_dir);
+  // A log folder that cannot be made is not a reason to refuse to start.
+  std::error_code dir_ec;
+  std::filesystem::create_directories(logs_dir, dir_ec);
+  if (dir_ec) {
+    std::fprintf(stderr, "logging: cannot create %s (%s); no log file\n", logs_dir.string().c_str(),
+                 dir_ec.message().c_str());
+    return {};
+  }
 
   int max_seq = 0;
   std::string prefix = std::string(app_name) + "_";
@@ -226,12 +234,16 @@ void InitLogging(const LogConfig& config) {
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
   }
   if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-        resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
-        static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
-    sink->set_level(spdlog::level::trace);
-    sink->set_pattern(config.file_pattern);
-    g_file_sink = sink;
+    try {
+      auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+          resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
+          static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
+      sink->set_level(spdlog::level::trace);
+      sink->set_pattern(config.file_pattern);
+      g_file_sink = sink;
+    } catch (const spdlog::spdlog_ex& e) {
+      std::fprintf(stderr, "logging: cannot open %s (%s); no log file\n", resolved_path.c_str(), e.what());
+    }
   }
 
   g_extra_sinks = config.extra_sinks;

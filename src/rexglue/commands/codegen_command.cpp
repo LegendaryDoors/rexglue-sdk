@@ -36,9 +36,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Compare dot-separated numeric version strings (e.g. "0.7.5"). Trailing
-// pre-release/build metadata after '-' or '+' is ignored. Returns true when
-// lhs orders strictly before rhs.
+// Compares dot-separated numeric version strings, ignoring pre-release or
+// build metadata after '-' or '+'. True when lhs orders before rhs.
 bool VersionLess(std::string_view lhs, std::string_view rhs) {
   auto parse = [](std::string_view s) {
     std::vector<unsigned> parts;
@@ -73,7 +72,7 @@ bool VersionLess(std::string_view lhs, std::string_view rhs) {
 }
 
 // The upgrade scan only runs when the installed SDK is newer than the version
-// that last generated this project (or when the project was never stamped).
+// that last generated the project, or when it was never stamped.
 bool MigrationNeeded(std::string_view last_codegen_version, std::string_view installed_version) {
   return last_codegen_version.empty() || VersionLess(last_codegen_version, installed_version);
 }

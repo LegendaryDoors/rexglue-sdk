@@ -11,10 +11,8 @@
 // Operates on 32x32 tiled data format used by Xbox 360.
 // Each thread handles one output pixel (one 32x32 tile = 1024 threads).
 //
-// By default, picks the top-left pixel of each scale_x * scale_y block.
-// When xe_downscale_half_pixel_offset is set, samples from (scale/2, scale/2)
-// within each block to compensate for the half-pixel offset becoming a
-// full-pixel offset at higher resolutions.
+// The scaled resolve buffer holds, per guest granule, scale_x * scale_y
+// granule-sized sub-copies ordered column-major (sub_x * scale_y + sub_y).
 
 cbuffer XeResolveDownscaleConstants : register(b0) {
   uint xe_downscale_scale_x;         // 1 to kMaxDrawResolutionScaleAlongAxis
@@ -56,24 +54,33 @@ void main(uint3 xe_group_id : SV_GroupID,
   uint pixel_size = 1u << xe_downscale_pixel_size_log2;
   uint tile_size_1x = 32 * 32 * pixel_size;
   uint scale_xy = xe_downscale_scale_x * xe_downscale_scale_y;
-  uint tile_size_scaled = tile_size_1x * scale_xy;
 
-  // Compute offset within each scaled block to sample from.
-  // Without half-pixel correction: sample from (0, 0) = linear offset 0.
-  // With half-pixel correction: sample from (scale/2, scale/2) to compensate
-  // for the D3D9-style half-pixel offset shifting content by (N/2, N/2) pixels
-  // at Nx resolution.
-  uint block_sample_offset = 0u;
+  // Granule: the byte-contiguous horizontal pixel run of the tiled layout,
+  // which is also the unit the scaled buffer replicates per host sub-sample.
+  uint granule_bytes_log2 = min(4u, 3u + xe_downscale_pixel_size_log2);
+  uint granule_bytes = 1u << granule_bytes_log2;
+  uint granule_pixels_log2 = granule_bytes_log2 - xe_downscale_pixel_size_log2;
+
+  uint phase_x = 0u;
+  uint phase_y = 0u;
   [branch] if (xe_downscale_half_pixel_offset != 0u && scale_xy > 1u) {
-    uint offset_x = xe_downscale_scale_x >> 1u;
-    uint offset_y = xe_downscale_scale_y >> 1u;
-    block_sample_offset = offset_x + offset_y * xe_downscale_scale_x;
+    phase_x = xe_downscale_scale_x >> 1u;
+    phase_y = xe_downscale_scale_y >> 1u;
   }
 
-  // Source offset: base of the scaled block plus offset within block
-  uint src_offset = tile_index * tile_size_scaled +
-                    pixel_index * pixel_size * scale_xy +
-                    block_sample_offset * pixel_size;
+  // Guest byte offset of the output pixel, relative to the extent start
+  // (which is granule-aligned since resolves are tile-aligned).
+  uint dest_byte_offset = tile_index * tile_size_1x + pixel_index * pixel_size;
+  // The pixel's host sample position within its granule's host span, then the
+  // sub-copy holding it and the position inside that sub-copy.
+  uint pixel_in_granule =
+      (dest_byte_offset & (granule_bytes - 1u)) >> xe_downscale_pixel_size_log2;
+  uint host_x = xe_downscale_scale_x * pixel_in_granule + phase_x;
+  uint sub_x = host_x >> granule_pixels_log2;
+  uint host_in_granule = host_x & ((1u << granule_pixels_log2) - 1u);
+  uint src_offset = (dest_byte_offset & ~(granule_bytes - 1u)) * scale_xy +
+                    (sub_x * xe_downscale_scale_y + phase_y) * granule_bytes +
+                    (host_in_granule << xe_downscale_pixel_size_log2);
 
   // Destination offset in 1x buffer
   uint dst_offset = tile_index * tile_size_1x +

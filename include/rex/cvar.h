@@ -118,7 +118,8 @@ namespace rex::cvar {
 //=============================================================================
 
 std::vector<std::string> Init(int argc, char** argv);
-void LoadConfig(const std::filesystem::path& config_path);
+// Returns whether the file was read and applied; a parse error is logged.
+bool LoadConfig(const std::filesystem::path& config_path);
 void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();
@@ -135,6 +136,16 @@ enum class Lifecycle {
   kInitOnly,        // Can only be set during initialization (before FinalizeInit)
   kHotReload,       // Can be changed at runtime with immediate effect
   kRequiresRestart  // Can be changed, but only takes effect after restart
+};
+
+// Where a flag's current value came from, in ascending priority. A source
+// never overwrites a value a higher-priority source already set.
+enum class Source {
+  kDefault,      // Compiled-in default
+  kConfig,       // TOML config file
+  kEnvironment,  // REX_* environment variable
+  kCommandLine,  // --flag on the command line
+  kRuntime       // SetFlagByName from the console, settings UI, or code
 };
 
 // Validation constraints
@@ -160,6 +171,7 @@ struct FlagEntry {
   Constraints constraints;
   std::string default_value;
   bool is_debug_only = false;
+  Source source = Source::kDefault;
 };
 
 std::vector<FlagEntry>& GetRegistry();
@@ -178,6 +190,9 @@ void UnregisterFlag(std::string_view name);
 
 bool SetFlagByName(std::string_view name, std::string_view value);
 std::string GetFlagByName(std::string_view name);
+
+// Which source last wrote this flag. Returns Source::kDefault for unknown names.
+Source GetFlagSource(std::string_view name);
 
 // Invoke a registered command by name, passing the raw argument text.
 // Returns false if `name` is not registered or is not a FlagType::Command.

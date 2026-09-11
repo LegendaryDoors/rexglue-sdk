@@ -404,6 +404,13 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
 
+  // REX_WATCH_MEM companion: when the diagnostic is armed, log every physical
+  // allocation so the watched range's free and realloc history is visible.
+  if (getenv("REX_WATCH_MEM")) {
+    REXKRNL_WARN("REX_WATCH_MEM MmAllocatePhysicalMemoryEx -> virt={:#x} size={:#x} phys={:#x}",
+                 base_address, adjusted_size, heap->GetPhysicalAddress(base_address));
+  }
+
   return base_address;
 }
 
@@ -418,6 +425,17 @@ void MmFreePhysicalMemory_entry(u32 type, u32 base_address) {
   assert_true((base_address & 0x1F) == 0);
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address);
+
+  // REX_WATCH_MEM companion (see kernel/crt/memory.cpp): log frees with their
+  // region size while the diagnostic is armed. Diagnostic only.
+  if (getenv("REX_WATCH_MEM")) {
+    memory::HeapAllocationInfo info = {};
+    uint32_t region_size = heap->QueryRegionInfo(base_address, &info) ? info.region_size : 0;
+    REXKRNL_WARN("REX_WATCH_MEM MmFreePhysicalMemory virt={:#x} region_size={:#x} phys={:#x}",
+                 (uint32_t)base_address, region_size,
+                 REX_KERNEL_MEMORY()->GetPhysicalAddress(base_address));
+  }
+
   heap->Release(base_address);
 }
 

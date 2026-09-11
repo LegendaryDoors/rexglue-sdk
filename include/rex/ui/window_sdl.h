@@ -32,6 +32,9 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  // For SDL APIs that take the window itself, such as the native file dialogs.
+  SDL_Window* sdl_window() const { return sdl_window_; }
+  float GetDisplayRefreshRate() const override;
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);

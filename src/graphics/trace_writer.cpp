@@ -40,7 +40,15 @@ bool TraceWriter::Open(const std::filesystem::path& path, uint32_t title_id) {
   auto canonical_path = std::filesystem::absolute(path);
   if (canonical_path.has_parent_path()) {
     auto base_path = canonical_path.parent_path();
-    std::filesystem::create_directories(base_path);
+    // Non-throwing overload deliberately: a trace directory that cannot be
+    // created must log an error, not terminate the title from std::terminate.
+    std::error_code ec;
+    std::filesystem::create_directories(base_path, ec);
+    if (ec) {
+      REXGPU_ERROR("TraceWriter: cannot create trace directory {}: {}", base_path.string(),
+                   ec.message());
+      return false;
+    }
   }
 
   file_ = rex::filesystem::OpenFile(canonical_path, "wb");
@@ -241,6 +249,11 @@ void TraceWriter::WriteMemoryCommand(TraceCommandType type, uint32_t base_ptr, s
 }
 
 void TraceWriter::WriteEdramSnapshot(const void* snapshot) {
+  if (!file_) {
+    // Same no-trace-open guard as every other Write*; without it, callers such
+    // as InitializeTrace crash when invoked while no trace is being recorded.
+    return;
+  }
   EdramSnapshotCommand cmd = {};
   cmd.type = TraceCommandType::kEdramSnapshot;
 
@@ -285,6 +298,9 @@ void TraceWriter::WriteEvent(EventCommand::Type event_type) {
 
 void TraceWriter::WriteRegisters(uint32_t first_register, const uint32_t* register_values,
                                  uint32_t register_count, bool execute_callbacks_on_play) {
+  if (!file_) {
+    return;
+  }
   RegistersCommand cmd = {};
   cmd.type = TraceCommandType::kRegisters;
   cmd.first_register = first_register;
@@ -323,6 +339,9 @@ void TraceWriter::WriteRegisters(uint32_t first_register, const uint32_t* regist
 void TraceWriter::WriteGammaRamp(const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table,
                                  const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb,
                                  uint32_t gamma_ramp_rw_component) {
+  if (!file_) {
+    return;
+  }
   GammaRampCommand cmd = {};
   cmd.type = TraceCommandType::kGammaRamp;
   cmd.rw_component = uint8_t(gamma_ramp_rw_component);

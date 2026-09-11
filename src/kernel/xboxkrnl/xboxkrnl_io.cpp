@@ -12,8 +12,19 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <vector>
+
 #include <rex/filesystem/device.h>
+#include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/vfs.h>
 #include <rex/kernel/xboxkrnl/private.h>
+#include <rex/runtime.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
@@ -30,6 +41,36 @@
 #include <rex/thread/mutex.h>
 
 namespace rex::kernel::xboxkrnl {
+
+// REX_LOG_FILEOPS=<substring>[,...]: one line per file operation on a file
+// whose guest path contains a substring, with offsets, lengths, results.
+bool FileOpsLogged(std::string_view path) {
+  static const std::vector<std::string> filters = [] {
+    std::vector<std::string> result;
+    const char* value = std::getenv("REX_LOG_FILEOPS");
+    std::string all = value ? value : "";
+    for (char& c : all) c = char(std::tolower(uint8_t(c)));
+    size_t start = 0;
+    while (start <= all.size()) {
+      size_t comma = all.find(',', start);
+      if (comma == std::string::npos) comma = all.size();
+      if (comma > start) result.push_back(all.substr(start, comma - start));
+      start = comma + 1;
+    }
+    return result;
+  }();
+  if (filters.empty()) {
+    return false;
+  }
+  std::string lowered(path);
+  for (char& c : lowered) c = char(std::tolower(uint8_t(c)));
+  for (const std::string& filter : filters) {
+    if (lowered.find(filter) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
 using namespace rex::system;
 
 struct CreateOptions {
@@ -173,6 +214,12 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
   }
+  if (FileOpsLogged(target_path)) {
+    REXKRNL_INFO("FILEOP create path='{}' access={:#x} disp={:#x} options={:#x} -> {:#x} handle={:#x} action={}",
+                 target_path, (uint32_t)desired_access, (uint32_t)creation_disposition,
+                 (uint32_t)create_options, result, handle,
+                 XSUCCEEDED(result) ? uint32_t(file_action) : 0u);
+  }
   return result;
 }
 
@@ -219,6 +266,17 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
+      }
+      if (FileOpsLogged(file->path())) {
+        // The physical address ties a read to the GPU resource it fills;
+        // 0xffffffff means the buffer is not in physical memory.
+        REXKRNL_INFO(
+            "FILEOP read handle={:#x} offset={} len={} buf={:#x} phys={:#x} -> {:#x} bytes={} "
+            "pos={}",
+            (uint32_t)file_handle, byte_offset_ptr ? (int64_t)byte_offset : -1,
+            (uint32_t)buffer_length, buffer.guest_address(),
+            REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address()), result, bytes_read,
+            file->position());
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
@@ -410,6 +468,12 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = static_cast<uint32_t>(bytes_written);
+      }
+      if (FileOpsLogged(file->path())) {
+        REXKRNL_INFO("FILEOP write handle={:#x} offset={} len={} -> {:#x} bytes={} pos={}",
+                     (uint32_t)file_handle,
+                     byte_offset_ptr ? (int64_t)static_cast<uint64_t>(*byte_offset_ptr) : -1,
+                     (uint32_t)buffer_length, result, bytes_written, file->position());
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
@@ -747,8 +811,44 @@ u32 IoSynchronousDeviceIoControlRequest_entry(u32 ioctl, mapped_void device_obje
 }
 
 u32 StfsCreateDevice_entry(mapped_void device_object, u32 flags, mapped_u32 out_device) {
-  REXKRNL_WARN("StfsCreateDevice - stub");
-  // if (out_device) *out_device = 0;
+  // Mounts the console's utility ("cache") partition. It is scratch space,
+  // not a content package, so back it with a host directory.
+  static int utility_device_index = 0;
+
+  auto* kernel_state = REX_KERNEL_STATE();
+  if (!kernel_state) {
+    REXKRNL_ERROR("StfsCreateDevice: no kernel state");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  const int index = utility_device_index++;
+  const std::string mount_path = fmt::format("\\Device\\cache{}", index);
+
+  auto root = kernel_state->emulator()->user_data_root();
+  if (root.empty()) {
+    REXKRNL_WARN("StfsCreateDevice: no user data root, cache partition unavailable");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  auto host_path = root / "cache" / fmt::format("cache{}", index);
+
+  std::error_code ec;
+  std::filesystem::create_directories(host_path, ec);
+  if (ec) {
+    REXKRNL_ERROR("StfsCreateDevice: cannot create {}: {}", host_path.string(), ec.message());
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  auto* fs = kernel_state->file_system();
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(mount_path, host_path,
+                                                                  /*read_only=*/false,
+                                                                  /*allow_share_delete=*/true);
+  if (!device->Initialize() || !fs->RegisterDevice(std::move(device))) {
+    REXKRNL_ERROR("StfsCreateDevice: failed to register {}", mount_path);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  REXKRNL_INFO("StfsCreateDevice: mounted {} -> {} (flags={:08X})", mount_path, host_path.string(),
+               uint32_t(flags));
   return X_STATUS_SUCCESS;
 }
 

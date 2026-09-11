@@ -303,6 +303,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;
+  bool config_loaded_ = false;
 };
 
 }  // namespace rex

@@ -80,7 +80,10 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Records that a resolve wrote the range. shared_memory_holds_copy tells
+  // whether the shared memory buffer also received the 1x image of it.
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                           bool shared_memory_holds_copy = false);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
@@ -226,7 +229,10 @@ class TextureCache {
     bool mips_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return mips_outdated_;
     }
-    void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+    // Clears the outdated state and registers the memory watch. Pass false to
+    // keep a subresource outdated when its guest memory was rewritten since.
+    void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock, bool base,
+                              bool mips);
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
@@ -237,6 +243,23 @@ class TextureCache {
     void MarkAsUsed();
 
     void LogAction(const char* action) const;
+
+    // REX_VERIFY_TEXTURES bookkeeping, maintained by the texture cache: the
+    // hash of the guest bytes each subresource was last loaded from.
+    struct VerificationState {
+      uint64_t base_hash = 0;
+      uint64_t mips_hash = 0;
+      uint64_t base_loaded_submission = 0;
+      uint64_t mips_loaded_submission = 0;
+      uint64_t last_checked_submission = UINT64_MAX;
+      uint32_t base_gpu_written_pages = 0;
+      uint32_t mips_gpu_written_pages = 0;
+      bool base_known = false;
+      bool mips_known = false;
+      bool base_reported = false;
+      bool mips_reported = false;
+    };
+    VerificationState& verification() { return verification_; }
 
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
@@ -273,6 +296,8 @@ class TextureCache {
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+
+    VerificationState verification_;
   };
 
   // Rules of data access in load shaders:
@@ -560,6 +585,13 @@ class TextureCache {
                           size_t& pending_range_count_out);
   bool CommitPreparedTextureLoad(const PendingTextureLoad& pending_load);
 
+  // REX_VERIFY_TEXTURES: remember what a texture was loaded from and check at
+  // each draw that the guest memory of every bound texture matches it.
+  void RecordVerificationHashes(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                Texture& texture, bool base, bool mips);
+  void VerifyBoundTextures(uint32_t used_texture_mask);
+  void VerifyTexture(Texture& texture, uint32_t fetch_constant_index);
+
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 
   // Shared memory callback for texture data invalidation.
@@ -569,6 +601,9 @@ class TextureCache {
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // True only if every page of the range is marked scaled-resolved. Loading
+  // from the scaled resolve buffer otherwise reads bytes it never wrote.
+  bool IsRangeFullyScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
@@ -612,6 +647,10 @@ class TextureCache {
   // so need to recheck if textures aren't outdated, disregarding whether fetch
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
+
+  uint64_t verify_textures_checked_ = 0;
+  uint64_t verify_textures_stale_ = 0;
+  uint64_t verify_last_reported_submission_ = UINT64_MAX;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch

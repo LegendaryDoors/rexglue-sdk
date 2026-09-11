@@ -41,6 +41,9 @@ class TracePlayer : public TraceReader {
   uint32_t playback_percent() const { return playback_percent_; }
 
   void SeekFrame(int target_frame);
+  // Positions playback at the start of a frame without playing it, so a
+  // following SeekCommand() does not apply the frame's effects twice.
+  void SeekFrameStart(int target_frame);
   void SeekCommand(int target_command);
 
   void WaitOnPlayback();

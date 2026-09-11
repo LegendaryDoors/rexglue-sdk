@@ -179,6 +179,9 @@ class Runtime {
  private:
   // Set up VFS: mounts game_data_root as game:/d:, update_data_root as update:
   bool SetupVfs();
+  // Installs the content packages named by --install_content for the loaded
+  // title; needs the title id, so it runs once the executable is loaded.
+  void InstallContentPackages();
 
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;

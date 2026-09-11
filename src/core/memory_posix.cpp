@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -20,6 +21,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#if REX_PLATFORM_LINUX
+#include <sys/ioctl.h>
+
+#include <linux/fs.h>
+#endif
 
 #include <rex/math.h>
 #include <rex/memory/utils.h>
@@ -134,8 +141,9 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
   return out.start < out.end;
 }
 
-// Find the mapping entry in /proc/self/maps that contains the given address
-static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
+// Finds the /proc/self/maps entry containing an address by parsing the file.
+// Slow and not async-signal-safe; only a fallback for PROCMAP_QUERY.
+static bool FindEntryForAddressByParsing(void* address, LinuxMapEntry& out_entry) {
   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
   std::ifstream maps("/proc/self/maps");
   if (!maps.is_open())
@@ -151,6 +159,80 @@ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
     }
   }
   return false;
+}
+
+#ifdef PROCMAP_QUERY
+// PROCMAP_QUERY (Linux 6.11+) answers which VMA covers an address with one
+// ioctl: no parsing and no allocation, so it is safe in a signal handler.
+
+// -1 = not yet probed, -2 = unsupported (fall back to parsing), >= 0 = usable fd.
+static std::atomic<int> procmap_query_fd{-1};
+
+static int GetProcMapsQueryFd() {
+  int fd = procmap_query_fd.load(std::memory_order_acquire);
+  if (fd != -1) {
+    return fd;
+  }
+
+  // Probe once. Racing threads may each open an fd; the loser closes its own.
+  int new_fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (new_fd >= 0) {
+    // Confirm the kernel actually implements the ioctl before committing to it.
+    struct procmap_query probe;
+    std::memset(&probe, 0, sizeof(probe));
+    probe.size = sizeof(probe);
+    probe.query_flags = PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
+    probe.query_addr = reinterpret_cast<uint64_t>(&procmap_query_fd);
+    if (ioctl(new_fd, PROCMAP_QUERY, &probe) != 0 && errno != ENOENT) {
+      // ENOENT just means "no VMA at/after this address", which still proves
+      // the ioctl exists. Anything else (ENOTTY, EINVAL) means it does not.
+      close(new_fd);
+      new_fd = -2;
+    }
+  } else {
+    new_fd = -2;
+  }
+
+  int expected = -1;
+  if (!procmap_query_fd.compare_exchange_strong(expected, new_fd, std::memory_order_acq_rel)) {
+    if (new_fd >= 0) {
+      close(new_fd);
+    }
+    return expected;
+  }
+  return new_fd;
+}
+#endif  // PROCMAP_QUERY
+
+// Find the mapping entry in /proc/self/maps that contains the given address.
+static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
+#ifdef PROCMAP_QUERY
+  const int fd = GetProcMapsQueryFd();
+  if (fd >= 0) {
+    struct procmap_query q;
+    std::memset(&q, 0, sizeof(q));
+    q.size = sizeof(q);
+    q.query_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(address));
+    // No COVERING_OR_NEXT_VMA: we want the covering VMA only, so an address in
+    // a hole reports "not mapped" rather than the next mapping along.
+    if (ioctl(fd, PROCMAP_QUERY, &q) == 0) {
+      out_entry = LinuxMapEntry{};
+      out_entry.start = static_cast<uintptr_t>(q.vma_start);
+      out_entry.end = static_cast<uintptr_t>(q.vma_end);
+      out_entry.perms[0] = (q.vma_flags & PROCMAP_QUERY_VMA_READABLE) ? 'r' : '-';
+      out_entry.perms[1] = (q.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) ? 'w' : '-';
+      out_entry.perms[2] = (q.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) ? 'x' : '-';
+      out_entry.perms[3] = (q.vma_flags & PROCMAP_QUERY_VMA_SHARED) ? 's' : 'p';
+      out_entry.perms[4] = '\0';
+      return out_entry.start < out_entry.end;
+    }
+    if (errno == ENOENT) {
+      return false;  // Address is not mapped.
+    }
+    // Any other error: fall through to the parsing path rather than lie.
+  }
+#endif  // PROCMAP_QUERY
+  return FindEntryForAddressByParsing(address, out_entry);
 }
 
 // Check if [base, base+length) is fully covered by existing mappings (no gaps)
@@ -377,6 +459,9 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // Unlink now, while holding the descriptor: a POSIX shared memory object
+  // outlives its creator, so an abnormal exit would leak the whole mapping.
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
@@ -384,6 +469,8 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
   close(static_cast<int>(handle));
 #if !REX_PLATFORM_ANDROID
+  // Normally a no-op: CreateFileMappingHandle unlinks as soon as the object
+  // exists. Kept for objects created by a path that does not unlink eagerly.
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
 #endif

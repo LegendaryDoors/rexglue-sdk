@@ -96,6 +96,22 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Like RangeWrittenByGpu, but for GPU writes that landed in a separate
+  // buffer, so this buffer's copy is marked outdated instead of valid.
+  void RangeWrittenByGpuOutsideBuffer(uint32_t start, uint32_t length);
+
+  // Number of pages in the range whose GPU copy is out of date with guest
+  // memory. Takes the global critical region internally.
+  uint32_t CountOutdatedPages(uint32_t start, uint32_t length);
+
+  // REX_VERIFY_TEXTURES. Hashes the guest memory of the range page by page,
+  // skipping GPU-written pages. Call within the global critical region.
+  uint64_t HashGuestRangeCpuPages(uint32_t start, uint32_t length,
+                                  uint32_t* gpu_written_pages_out) const;
+  // REX_VERIFY_TEXTURES. Logs SMSTALE for every valid, CPU-owned page whose
+  // guest memory no longer matches its upload hash. Returns how many.
+  uint32_t VerifyRangeAgainstUpload(uint32_t start, uint32_t length);
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
@@ -140,6 +156,9 @@ class SharedMemory {
   // overall bounds of pages to be uploaded.
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+  // REX_VERIFY_TEXTURES. Records the hash of the bytes just uploaded for the
+  // page-aligned range; call from UploadRanges with the memcpy source.
+  void RecordUploadedPages(uint32_t start, const uint8_t* source, uint32_t length);
 
   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
     return trace_download_ranges_;
@@ -196,10 +215,24 @@ class SharedMemory {
   std::atomic<uint64_t*> staging_valid_flags_{nullptr};
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
+  // Pages whose newest GPU-written data lives in a separate buffer. Like
+  // GPU-written pages, they must not be swept up by invalidation widening.
+  std::vector<uint64_t> system_page_flags_gpu_written_outside_buffer_;
   // Dirty state tracking for frame-end page-state refresh.
   std::atomic<bool> gpu_written_data_dirty_{false};
   std::atomic<uint32_t> dirty_blocks_{0};
   uint32_t num_system_page_flags_ = 0;
+
+  // REX_VERIFY_TEXTURES state, empty when the diagnostic is off. Touched only
+  // by the thread that requests ranges.
+  std::vector<uint64_t> upload_page_hashes_;
+  std::vector<uint64_t> upload_page_hash_known_;
+  std::vector<uint64_t> verify_reported_pages_;
+  std::vector<uint64_t> verify_checked_pages_;
+  uint64_t verify_checked_submission_ = UINT64_MAX;
+  uint64_t verify_pages_checked_ = 0;
+  uint64_t verify_pages_stale_ = 0;
+  uint32_t verify_lines_logged_ = 0;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

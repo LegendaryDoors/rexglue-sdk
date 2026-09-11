@@ -1058,16 +1058,18 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
 
+  // The object is always tried before the deadline is judged: a zero timeout
+  // is a state check, and a signaled object must satisfy it.
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
     }
-    if (HasAlertableTimeoutElapsed(deadline)) {
-      return WaitResult::kTimeout;
-    }
     auto result = posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline));
     if (result != WaitResult::kTimeout) {
       return result;
+    }
+    if (HasAlertableTimeoutElapsed(deadline)) {
+      return WaitResult::kTimeout;
     }
   }
 }
@@ -1094,12 +1096,12 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
     }
-    if (HasAlertableTimeoutElapsed(deadline)) {
-      return WaitResult::kTimeout;
-    }
     result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline));
     if (result != WaitResult::kTimeout) {
       return result;
+    }
+    if (HasAlertableTimeoutElapsed(deadline)) {
+      return WaitResult::kTimeout;
     }
   }
 }
@@ -1126,13 +1128,13 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
     if (DispatchCurrentThreadUserCallback()) {
       return std::make_pair(WaitResult::kUserCallback, 0);
     }
-    if (HasAlertableTimeoutElapsed(deadline)) {
-      return std::make_pair(WaitResult::kTimeout, 0);
-    }
     auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
                                                    wait_all, ComputeAlertableWaitTimeout(deadline));
     if (result.first != WaitResult::kTimeout) {
       return result;
+    }
+    if (HasAlertableTimeoutElapsed(deadline)) {
+      return std::make_pair(WaitResult::kTimeout, 0);
     }
   }
 }
@@ -1312,12 +1314,19 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+    // Arm the suspend counter in the SAME critical section that publishes the
+    // started state. Resume() only waits for state_ != kUninitialized, so if it
+    // observed the state published here while suspend_count_ was still 0 it
+    // would take the "not suspended" path, return false without decrementing,
+    // and the wait below would then never be satisfied.
+    if (create_suspended) {
+      thread->handle_.suspend_count_ = 1;
+    }
     thread->handle_.state_signal_.notify_all();
   }
 
   if (create_suspended) {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
     thread->handle_.state_signal_.wait(lock,
                                        [thread] { return thread->handle_.suspend_count_ == 0; });
   }

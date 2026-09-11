@@ -11,6 +11,8 @@
 
 #include <rex/ui/windowed_app_context_sdl.h>
 
+#include <vector>
+
 #include <cstdlib>
 
 #include <SDL3/SDL.h>
@@ -32,9 +34,8 @@ SDLWindowedAppContext::~SDLWindowedAppContext() {
 
 bool SDLWindowedAppContext::Initialize() {
 #if !REX_PLATFORM_WIN32
-  // The Surface types the presenters consume are Win32Hwnd and XcbWindow;
-  // force X11 so an xcb connection is retrievable (there is no Wayland
-  // surface type).
+  // The Surface types the presenters consume are Win32Hwnd and XcbWindow, so
+  // force X11: an xcb connection must be retrievable.
   SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
 #endif
   if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
@@ -79,6 +80,20 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
 void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
   if (event.type == wakeup_event_type_) {
     ExecutePendingFunctionsFromUIThread();
+    return;
+  }
+  if (event.type == SDL_EVENT_QUIT) {
+    // SIGINT/SIGTERM arrive here, as does the last window closing. Close the
+    // windows as their close buttons would, so the closing handler runs.
+    if (windows_.empty()) {
+      QuitFromUIThread();
+      return;
+    }
+    // Closing unregisters the window, so iterate over a copy.
+    std::vector<WindowSDL*> windows;
+    windows.reserve(windows_.size());
+    for (const auto& [id, window] : windows_) windows.push_back(window);
+    for (WindowSDL* window : windows) window->RequestClose();
     return;
   }
   if (event.type == paint_event_type_) {

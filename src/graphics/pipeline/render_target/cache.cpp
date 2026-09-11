@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <tuple>
@@ -19,6 +20,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/diagnostic_gate.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/register_file.h>
@@ -1290,6 +1292,10 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   bool dest_is_64bpp = dest.Is64bpp();
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
+  // REX_LOG_OWNERSHIP=1 logs one line per EDRAM tile ownership claim that
+  // changes the owner, with the old and new owner keys and any transfer.
+  static const bool log_ownership_set = std::getenv("REX_LOG_OWNERSHIP") != nullptr;
+  const bool log_ownership = log_ownership_set && rex::graphics::diag::LogGateOpen();
   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
     // The map contains consecutive ranges, merged if the adjacent ones are the
     // same. Find the range starting at >= the start. A portion of the range
@@ -1327,6 +1333,9 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         ownership_ranges_.emplace(extent_end, it->second);
         it->second.end_tiles = extent_end;
       }
+      // For REX_LOG_OWNERSHIP only - why no transfer was recorded (or that
+      // one was).
+      const char* ownership_log_transfer_status = "barrier_only";
       if (transfers_append_out) {
         RenderTargetKey transfer_source = it->second.render_target;
         // Only perform the copying when actually changing the latest owner, not
@@ -1357,6 +1366,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
               // Extend the last transfer if, for example, transferring color,
               // but host depth is different.
               transfers_append_out->back().end_tiles = transfer_end_tiles;
+              ownership_log_transfer_status = "recorded_merged";
             } else {
               auto transfer_source_rt_it = render_targets_.find(transfer_source);
               if (transfer_source_rt_it != render_targets_.end()) {
@@ -1374,11 +1384,29 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                       transfer_host_depth_source_rt_it != render_targets_.end()
                           ? transfer_host_depth_source_rt_it->second
                           : nullptr);
+                  ownership_log_transfer_status = "recorded";
+                } else {
+                  ownership_log_transfer_status = "DROPPED_host_depth_rt_missing";
                 }
+              } else {
+                ownership_log_transfer_status = "DROPPED_source_rt_missing";
               }
             }
+          } else {
+            ownership_log_transfer_status = "cutout_covers_range";
           }
+        } else {
+          ownership_log_transfer_status =
+              transfer_source.IsEmpty() ? "prev_empty" : "host_depth_only";
         }
+      }
+      if (log_ownership) {
+        REXGPU_INFO("OWNLOG claim [{},{}) prev=[{}] new=[{}] transfer={}", it->first,
+                    it->second.end_tiles,
+                    it->second.render_target.IsEmpty()
+                        ? std::string("EMPTY")
+                        : it->second.render_target.GetDebugName(),
+                    dest.GetDebugName(), ownership_log_transfer_status);
       }
       // Claim the current range.
       it->second.render_target = dest;

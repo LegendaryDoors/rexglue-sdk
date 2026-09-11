@@ -45,6 +45,9 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
   }
 
   if (file_handle_->Write(byte_offset, buffer.data(), buffer.size(), out_bytes_written)) {
+    // Directory enumeration reports the entry's cached size, so a write that
+    // grows the file must update it at once.
+    entry_->update();
     return X_STATUS_SUCCESS;
   } else {
     return X_STATUS_END_OF_FILE;

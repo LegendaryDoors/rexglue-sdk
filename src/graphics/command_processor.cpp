@@ -21,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
+#include <rex/graphics/diagnostic_gate.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
@@ -33,6 +34,7 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/stall_dump.h>
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
@@ -48,9 +50,10 @@ REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion 
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"
-                      " fast: Read previous frame (delayed, copy every frame)\n"
-                      " some: Read previous frame (delayed, copy on cache miss)\n"
-                      " full: Immediate sync readback (accurate but stalls)")
+                      " fast: Exact; installed once the GPU has produced it, and a GPU fence\n"
+                      "       the guest polls after the resolve waits for that (no stalls)\n"
+                      " some: Same as fast, kept for existing configurations\n"
+                      " full: Immediate sync readback (accurate but stalls on every resolve)")
     .allowed({"none", "fast", "some", "full"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
@@ -78,6 +81,15 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "Compile shaders and create pipelines asynchronously in background "
                     "threads. This reduces stutter but may cause brief visual artifacts while "
                     "pipelines are being prepared.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_UINT32(
+    gpu_wait_reg_mem_abort_ms, 0, "GPU",
+    "DIAGNOSTIC. Give up on a PM4 WAIT_REG_MEM poll after this many milliseconds and let the "
+    "command processor continue as though the condition had been met. 0 (the default) keeps the "
+    "hardware-correct behaviour of waiting forever. Continuing past an unmet wait is incorrect - "
+    "the guest asked to be blocked - so this exists only to see what the title does next when a "
+    "poll can never be satisfied. A stall is reported in the log regardless of this setting.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
@@ -145,56 +157,157 @@ bool CommandProcessor::Initialize() {
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
 
+  // Contribute the ring state to every stall dump, not just the ones the GPU
+  // triggers: a wedged CPU still needs to know whether the GPU is idle.
+  rex::system::RegisterStallSection("GPU command processor", [this]() { LogRingState(); });
+
   return true;
 }
 
 void CommandProcessor::Shutdown() {
-  EndTracing();
+  rex::system::UnregisterStallSection("GPU command processor");
 
   worker_running_ = false;
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
+
+  // The worker is gone, so this is the one place the file can be closed
+  // without racing its writes.
+  trace_state_.store(TraceState::kDisabled, std::memory_order_relaxed);
+  if (trace_writer_.is_open()) {
+    trace_writer_.Close();
+  }
+}
+
+void CommandProcessor::LogRingState() {
+  REXGPU_ERROR(
+      "  ring: read_ptr={} write_ptr={} primary_buffer={:#010X} size={:#X} "
+      "writeback_ptr={:#010X} writeback_value={:#010X} vblanks={} swaps={} worker_running={}",
+      read_ptr_index_, write_ptr_index_.load(), primary_buffer_ptr_, primary_buffer_size_,
+      read_ptr_writeback_ptr_,
+      read_ptr_writeback_ptr_
+          ? memory::load_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_))
+          : 0u,
+      counter_, swap_count_.load(), worker_running_.load() ? "yes" : "no");
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                uint32_t title_id, bool blocking) {}
 
+// REX_HASH_GUEST_RANGE=<hex addr>,<hex len>[,<path>] hashes a guest memory
+// range at every swap and logs changes, writing new bytes to <path>.<n>.
+void CommandProcessor::HashGuestRangeDiagnostic() {
+  struct Spec {
+    uint32_t address = 0;
+    uint32_t length = 0;
+    std::string path;
+  };
+  static const Spec spec = [] {
+    Spec result;
+    const char* value = std::getenv("REX_HASH_GUEST_RANGE");
+    if (!value) {
+      return result;
+    }
+    std::string text(value);
+    size_t comma1 = text.find(',');
+    if (comma1 == std::string::npos) {
+      return result;
+    }
+    size_t comma2 = text.find(',', comma1 + 1);
+    result.address = uint32_t(std::strtoul(text.substr(0, comma1).c_str(), nullptr, 16));
+    result.length = uint32_t(std::strtoul(
+        text.substr(comma1 + 1, comma2 == std::string::npos ? std::string::npos : comma2 - comma1 - 1)
+            .c_str(),
+        nullptr, 16));
+    if (comma2 != std::string::npos) {
+      result.path = text.substr(comma2 + 1);
+    }
+    return result;
+  }();
+  if (!spec.length) {
+    return;
+  }
+  const uint8_t* bytes = memory_->TranslatePhysical(spec.address & 0x1FFFFFFF);
+  if (!bytes) {
+    return;
+  }
+  uint64_t hash = 14695981039346656037ull;
+  uint32_t nonzero = 0;
+  for (uint32_t i = 0; i < spec.length; ++i) {
+    hash = (hash ^ bytes[i]) * 1099511628211ull;
+    nonzero += bytes[i] != 0;
+  }
+  static uint64_t last_hash = 0;
+  static uint32_t change_count = 0;
+  if (hash == last_hash) {
+    return;
+  }
+  last_hash = hash;
+  REXGPU_INFO("GUESTRANGE {:08X}+{:X} content #{} at swap {}: hash={:016X} nonzero_bytes={}",
+              spec.address, spec.length, change_count, swap_count_.load(), hash, nonzero);
+  if (!spec.path.empty() && change_count < 16) {
+    std::string path = fmt::format("{}.{}", spec.path, change_count);
+    if (FILE* file = fopen(path.c_str(), "wb")) {
+      fwrite(bytes, 1, spec.length, file);
+      fclose(file);
+    }
+  }
+  ++change_count;
+}
+
 void CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
-  if (trace_state_ == TraceState::kStreaming) {
+  TraceState state = trace_state_.load(std::memory_order_acquire);
+  if (state == TraceState::kStreaming || state == TraceState::kStreamEndRequested) {
     REXGPU_ERROR("Streaming trace; cannot also trace frame.");
     return;
   }
-  if (trace_state_ == TraceState::kSingleFrame) {
+  if (state == TraceState::kSingleFrame) {
     REXGPU_ERROR("Frame trace already pending; ignoring.");
     return;
   }
-  trace_state_ = TraceState::kSingleFrame;
   trace_frame_path_ = root_path;
+  trace_state_.store(TraceState::kSingleFrame, std::memory_order_release);
 }
 
 void CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
-  if (trace_state_ == TraceState::kStreaming) {
+  TraceState state = trace_state_.load(std::memory_order_acquire);
+  if (state == TraceState::kStreaming || state == TraceState::kStreamEndRequested) {
     REXGPU_ERROR("Streaming already active; ignoring request.");
     return;
   }
-  if (trace_state_ == TraceState::kSingleFrame) {
+  if (state == TraceState::kSingleFrame) {
     REXGPU_ERROR("Frame trace pending; ignoring streaming request.");
     return;
   }
-  // Streaming starts on the next primary buffer execute.
-  trace_state_ = TraceState::kStreaming;
+  // The path must be visible to the worker before the state that tells it to
+  // open the file, hence the release store after the assignment.
   trace_stream_path_ = root_path;
+  trace_state_.store(TraceState::kStreaming, std::memory_order_release);
 }
 
 void CommandProcessor::EndTracing() {
-  if (!trace_writer_.is_open()) {
-    return;
-  }
-  assert_true(trace_state_ == TraceState::kStreaming);
-  trace_state_ = TraceState::kDisabled;
-  trace_writer_.Close();
+  TraceState expected = TraceState::kStreaming;
+  // Only the worker may close the file; it does so after the next swap.
+  trace_state_.compare_exchange_strong(expected, TraceState::kStreamEndRequested,
+                                       std::memory_order_acq_rel);
 }
+
+namespace {
+
+// A stream trace can take hours to record, so a later run into the same
+// directory must never overwrite one.
+std::filesystem::path UnusedTracePath(const std::filesystem::path& directory,
+                                      const std::string& stem) {
+  std::filesystem::path path = directory / (stem + ".xtr");
+  std::error_code ec;
+  for (uint32_t n = 2; std::filesystem::exists(path, ec); ++n) {
+    path = directory / fmt::format("{}_{}.xtr", stem, n);
+  }
+  return path;
+}
+
+}  // namespace
 
 void CommandProcessor::RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
                                         uint32_t register_count, bool execute_callbacks) {
@@ -302,6 +415,11 @@ void CommandProcessor::WorkerThreadMain() {
 
         rex::thread::MaybeYield();
         loop_count++;
+        // Every pass once the loop sleeps, since each pass is then 5 ms and a
+        // guest may be spinning on a fence this releases; every 64th when hot.
+        if (loop_count > 500 || (loop_count & 0x3F) == 0) {
+          OnIdleSpin();
+        }
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
@@ -389,6 +507,10 @@ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  // Logged because a title that re-initialises the ring mid-startup, or polls
+  // an address the ring was supposed to publish to, is otherwise invisible.
+  REXGPU_INFO("Ring buffer initialized: ptr={:#010X} size_log2={} size={:#X} bytes",
+              primary_buffer_ptr_, size_log2, primary_buffer_size_);
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
@@ -399,6 +521,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.
   read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
+  REXGPU_INFO(
+      "Read pointer write-back enabled: writeback_ptr={:#010X} block_size_log2={} "
+      "update_freq={} (the read pointer is only published after ExecutePrimaryBuffer returns)",
+      read_ptr_writeback_ptr_, block_size_log2, read_ptr_update_freq_);
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -693,12 +819,14 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
   // If we have a pending trace stream open it now. That way we ensure we get
   // all commands.
-  if (!trace_writer_.is_open() && trace_state_ == TraceState::kStreaming) {
+  if (!trace_writer_.is_open() &&
+      trace_state_.load(std::memory_order_acquire) == TraceState::kStreaming) {
     uint32_t title_id =
         kernel_state_->GetExecutableModule() ? kernel_state_->GetExecutableModule()->title_id() : 0;
-    auto file_name = fmt::format("{:08X}_stream.xtr", title_id);
-    auto path = trace_stream_path_ / file_name;
-    trace_writer_.Open(path, title_id);
+    trace_stream_file_ =
+        UnusedTracePath(trace_stream_path_, fmt::format("{:08X}_stream", title_id));
+    trace_stream_swaps_ = 0;
+    trace_writer_.Open(trace_stream_file_, title_id);
     InitializeTrace();
   }
 
@@ -1006,15 +1134,30 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   trace_writer_.WritePacketEnd();
   if (opcode == PM4_XE_SWAP) {
+    swap_count_.fetch_add(1, std::memory_order_relaxed);
+    // A real present is this project's definition of still making progress.
+    // The vblank counter is not: it keeps ticking through a total wedge.
+    rex::system::NoteStallHeartbeat();
+    HashGuestRangeDiagnostic();
     // End the trace writer frame.
+    TraceState trace_state = trace_state_.load(std::memory_order_acquire);
     if (trace_writer_.is_open()) {
       trace_writer_.WriteEvent(EventCommand::Type::kSwap);
       trace_writer_.Flush();
-      if (trace_state_ == TraceState::kSingleFrame) {
-        trace_state_ = TraceState::kDisabled;
+      ++trace_stream_swaps_;
+      if (trace_state == TraceState::kSingleFrame) {
+        trace_state_.store(TraceState::kDisabled, std::memory_order_release);
+        trace_writer_.Close();
+      } else if (trace_state == TraceState::kStreamEndRequested) {
+        REXGPU_INFO("TraceWriter: closed stream trace after {} frames: {}", trace_stream_swaps_,
+                    trace_stream_file_.string());
+        trace_state_.store(TraceState::kDisabled, std::memory_order_release);
         trace_writer_.Close();
       }
-    } else if (trace_state_ == TraceState::kSingleFrame) {
+    } else if (trace_state == TraceState::kStreamEndRequested) {
+      // Stopped before the first primary buffer ever opened the file.
+      trace_state_.store(TraceState::kDisabled, std::memory_order_release);
+    } else if (trace_state == TraceState::kSingleFrame) {
       // New trace request - we only start tracing at the beginning of a frame.
       uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
       auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
@@ -1096,6 +1239,16 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  // Companion of the REX_LOG_DRAWS census: which guest buffer a frame's
+  // resolves must have reached for the swap to show them.
+  {
+    static const bool log_draws = getenv("REX_LOG_DRAWS") != nullptr;
+    if (log_draws && rex::graphics::diag::LogGateOpen()) {
+      REXGPU_INFO("DRAWLOG SWAP frontbuffer={:08X} {}x{}", frontbuffer_ptr, frontbuffer_width,
+                  frontbuffer_height);
+    }
+  }
+
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
@@ -1127,12 +1280,27 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // volatile: the polled location is written by another thread or by the GPU's
+  // own writeback, so the load must not be hoisted out of the spin below.
+  const volatile uint32_t* memory_value_ptr =
+      is_memory ? reinterpret_cast<const volatile uint32_t*>(
+                      memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)))
+                : nullptr;
+
+  // This poll has no upper bound by design, so a condition that can never be
+  // met would wedge the GPU thread silently. Report once, then periodically.
+  const auto wait_began = std::chrono::steady_clock::now();
+  constexpr auto kStallReportAfter = std::chrono::seconds(3);
+  constexpr auto kStallReportEvery = std::chrono::seconds(15);
+  auto next_stall_report = wait_began + kStallReportAfter;
+  bool stall_reported = false;
+  uint64_t poll_iterations = 0;
+
   bool matched = false;
   do {
     uint32_t value = 0;
     if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      value = *memory_value_ptr;
       trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr & ~uint32_t(0x3)), sizeof(uint32_t));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
@@ -1169,6 +1337,44 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      ++poll_iterations;
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_stall_report) {
+        static const char* const kConditionNames[8] = {
+            "never", "value < ref", "value <= ref", "value == ref",
+            "value != ref", "value >= ref", "value > ref", "always"};
+        const auto stalled_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_began).count();
+        REXGPU_ERROR(
+            "WAIT_REG_MEM stalled {} ms ({} polls): waiting for {} {} where {} = {:#010X}, "
+            "ref={:#010X}, mask={:#010X}, masked={:#010X}, wait_info={:#X}, wait={:#X}. Nothing "
+            "the command processor does can satisfy this; it must be written by the guest CPU or "
+            "by GPU writeback.",
+            stalled_ms, poll_iterations, is_memory ? "physical address" : "register",
+            is_memory ? fmt::format("{:#010X}", poll_reg_addr & ~uint32_t(0x3))
+                      : fmt::format("{:#06X}", poll_reg_addr),
+            kConditionNames[wait_info & 0x7], value, ref, mask, value & mask, wait_info, wait);
+        // First report only: dump the whole guest picture alongside it. The
+        // poll itself never explains why nobody satisfied it.
+        if (!stall_reported) {
+          rex::system::DumpStallState(
+              fmt::format("GPU command processor wedged in WAIT_REG_MEM on {:#010X}",
+                          poll_reg_addr & ~uint32_t(0x3)));
+        }
+        stall_reported = true;
+        next_stall_report = now + kStallReportEvery;
+
+        uint32_t abort_ms = REXCVAR_GET(gpu_wait_reg_mem_abort_ms);
+        if (abort_ms && stalled_ms >= int64_t(abort_ms)) {
+          REXGPU_ERROR(
+              "WAIT_REG_MEM: gpu_wait_reg_mem_abort_ms={} reached, continuing as though the wait "
+              "had been satisfied. This is a diagnostic, not correct behaviour - the guest asked "
+              "to be blocked here.",
+              abort_ms);
+          return true;
+        }
+      }
+
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1190,6 +1396,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  if (stall_reported) {
+    const auto stalled_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - wait_began)
+                                .count();
+    REXGPU_ERROR("WAIT_REG_MEM: the stalled poll was finally satisfied after {} ms", stalled_ms);
+  }
 
   return true;
 }
@@ -1248,8 +1461,10 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
-    trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
+    if (!DeferGuestFenceWrite(addr, write_data)) {
+      memory::store(memory_->TranslatePhysical(addr), write_data);
+      trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
+    }
     write_addr += 4;
   }
 
@@ -1357,8 +1572,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
-  trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+  if (!DeferGuestFenceWrite(address, data_value)) {
+    memory::store(memory_->TranslatePhysical(address), data_value);
+    trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+  }
   return true;
 }
 
@@ -1413,10 +1630,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
     // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
     // and used to detect a finished query.
     bool is_end_via_z_pass =
-        pSampleCounts->ZPass_A == kQueryFinished && pSampleCounts->ZPass_B == kQueryFinished;
+        pSampleCounts->ZPass_A == kQueryFinished || pSampleCounts->ZPass_B == kQueryFinished;
     // Older versions of D3D also checks for ZFail (4D5307D5).
     bool is_end_via_z_fail =
-        pSampleCounts->ZFail_A == kQueryFinished && pSampleCounts->ZFail_B == kQueryFinished;
+        pSampleCounts->ZFail_A == kQueryFinished || pSampleCounts->ZFail_B == kQueryFinished;
     std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       pSampleCounts->ZPass_A = fake_sample_count;

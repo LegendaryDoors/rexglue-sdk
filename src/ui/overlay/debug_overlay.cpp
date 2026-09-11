@@ -37,7 +37,11 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
         ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+      } else {
+        ImGui::TextDisabled("Guest: no frames presented yet");
       }
+    } else {
+      ImGui::TextDisabled("Guest: no frame source");
     }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
     ImGui::Separator();

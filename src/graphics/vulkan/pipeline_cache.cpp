@@ -1246,6 +1246,12 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
     return false;
   }
 
+  // Dump the translated SPIR-V as well as the guest microcode: the translator
+  // wraps shaders in a dispatch loop that the guest ucode does not show.
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    translation.Dump(REXCVAR_GET(dump_shaders), "vulkan");
+  }
+
   // TODO(Triang3l): Log that the shader has been successfully translated in
   // common code.
 
@@ -3497,6 +3503,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         uint32_t(use_dynamic_rendering));
     return false;
   }
+  // Log the handle so a hung draw reported by VK_NV_device_diagnostic_checkpoints
+  // can be traced back to the shaders it was running.
+  REXGPU_INFO("Created pipeline {:#x} with VS {:016X}, PS {:016X}", uint64_t(pipeline),
+              creation_arguments.vertex_shader->shader().ucode_data_hash(),
+              creation_arguments.pixel_shader
+                  ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+                  : uint64_t(0));
+
   bool was_placeholder =
       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
   VkPipeline old_pipeline =

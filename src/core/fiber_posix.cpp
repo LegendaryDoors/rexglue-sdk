@@ -17,6 +17,8 @@
 #include <cassert>
 #include <ucontext.h>
 
+#include <rex/logging.h>
+
 namespace rex::thread {
 
 thread_local Fiber* Fiber::tls_current_ = nullptr;
@@ -58,16 +60,23 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
 
 void Fiber::SwitchTo(Fiber* target) {
   Fiber* from = tls_current_;
+  if (!from) {
+    // No fiber context for the calling thread, so there is nowhere to save the
+    // outgoing state. Refuse the switch rather than fault in swapcontext.
+    REXLOG_ERROR(
+        "Fiber::SwitchTo with no current fiber - refusing the switch. The calling thread has no "
+        "fiber context, probably after ConvertFiberToThread or a self DeleteFiber.");
+    return;
+  }
   tls_current_ = target;
   swapcontext(&from->context_, &target->context_);
 }
 
 void Fiber::Destroy() {
-  // Thread fibers are destroyed from the owning thread itself.
-  if (is_thread_fiber_) {
+  // Destroy() may be called from a thread that does not own the fiber, so
+  // clear the thread-local current-fiber pointer only when it points here.
+  if (tls_current_ == this) {
     tls_current_ = nullptr;
-  } else {
-    assert(this != tls_current_ && "Destroy called on the currently running fiber");
   }
   // No POSIX equivalent of ConvertFiberToThread; stack_ is freed by the vector destructor.
   delete this;

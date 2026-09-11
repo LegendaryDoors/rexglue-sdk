@@ -31,6 +31,14 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // VK_NV_device_diagnostic_checkpoints returns only the most recent marker
+  // per stage, so print the ring window after the last finished index.
+  static void DumpGpuCheckpointWindow(uint64_t last_finished_index, uint32_t count);
+
+  // Mark a submission boundary in the checkpoint ring, which otherwise spans
+  // submissions seamlessly.
+  static void NoteGpuSubmissionBoundary(uint64_t submission_index, uint32_t wait_semaphore_count);
+
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents) {

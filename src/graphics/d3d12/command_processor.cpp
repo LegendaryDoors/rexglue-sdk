@@ -19,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/graphics/diagnostic_gate.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
@@ -45,6 +46,12 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_log_swaps, false, "GPU/D3D12",
+                    "DIAGNOSTIC. Log one line per guest swap (frontbuffer address, format, gamma "
+                    "ramp peaks) and one per resolve copy (destination registers), to correlate "
+                    "what is presented with what was resolved. Costs nothing when off.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
@@ -197,9 +204,9 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
       return true;
     }
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -209,9 +216,9 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
   };
 
   bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
   bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
 
   if (!is_end) {
@@ -1953,6 +1960,25 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
+  if (REXCVAR_GET(d3d12_log_swaps)) {
+    // The ramp peaks distinguish a black frontbuffer from a fade-to-black
+    // gamma ramp applied to a correct one - the presented output is identical.
+    uint32_t table_max = 0;
+    const reg::DC_LUT_30_COLOR* table = gamma_ramp_256_entry_table();
+    for (uint32_t i = 0; i < 256; ++i) {
+      table_max = std::max({table_max, uint32_t(table[i].color_10_red),
+                            uint32_t(table[i].color_10_green), uint32_t(table[i].color_10_blue)});
+    }
+    uint32_t pwl_max = 0;
+    const reg::DC_LUT_PWL_DATA* pwl = gamma_ramp_pwl_rgb();
+    for (uint32_t i = 0; i < 128 * 3; ++i) {
+      pwl_max = std::max(pwl_max, uint32_t(pwl[i].base));
+    }
+    REXGPU_INFO("SWAPLOG fb={:08X} fmt={} packet={}x{} unscaled={}x{} table_max={:03X} pwl_max={:04X}",
+                frontbuffer_ptr, uint32_t(frontbuffer_format), frontbuffer_width,
+                frontbuffer_height, frontbuffer_width_unscaled, frontbuffer_height_unscaled,
+                table_max, pwl_max);
+  }
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region
   // from the swap packet, scaled proportionally to the actual source texture.
@@ -2921,6 +2947,15 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  if (REXCVAR_GET(d3d12_log_swaps)) {
+    const auto& regs = *register_file_;
+    REXGPU_INFO(
+        "COPYLOG control={:08X} dest_info={:08X} dest_base={:08X} dest_pitch={:08X} "
+        "surface_info={:08X}",
+        regs[XE_GPU_REG_RB_COPY_CONTROL], regs[XE_GPU_REG_RB_COPY_DEST_INFO],
+        regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_PITCH],
+        regs[XE_GPU_REG_RB_SURFACE_INFO]);
+  }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
@@ -3139,6 +3174,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+      if (REXCVAR_GET(d3d12_log_swaps)) {
+        // A content digest of what the GPU resolved, to tell a resolve that
+        // produced black from a later stage losing correct bytes. Sampled.
+        const uint8_t* bytes = static_cast<const uint8_t*>(rb.mapped_data[read_index]);
+        uint32_t nonzero = 0, samples = 0;
+        for (uint32_t i = 0; i < written_length; i += 64, ++samples) {
+          nonzero += bytes[i] != 0;
+        }
+        REXGPU_INFO("RBINSTALL dest={:08X} len={:X} nonzero64={}/{} miss={}", written_address,
+                    written_length, nonzero, samples, uint32_t(is_cache_miss));
+      }
     }
   }
 
@@ -3518,6 +3564,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+    rex::graphics::diag::SetCurrentSubmission(frame_current_);
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

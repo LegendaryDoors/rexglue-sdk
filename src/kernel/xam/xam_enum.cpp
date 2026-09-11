@@ -83,9 +83,40 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
   return result;
 }
 
-u32 XamCreateEnumeratorHandle_entry(u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5, u32 unk6,
-                                    u32 unk7, u32 unk8) {
-  return X_ERROR_INVALID_PARAMETER;
+// arg5 is used for both item_size and extra_size: the argument order is not
+// documented, and under either reading this cannot under-allocate.
+u32 XamCreateEnumeratorHandle_entry(u32 user_index, u32 app_id, u32 open_message,
+                                    u32 close_message, u32 item_size, u32 items_per_enumerate,
+                                    u32 flags, mapped_u32 handle_out) {
+  REXKRNL_DEBUG(
+      "XamCreateEnumeratorHandle(user={:08X} app={:08X} open={:08X} close={:08X} "
+      "item_size={} items_per_enum={} flags={:08X} out={:08X})",
+      user_index, app_id, open_message, close_message, item_size, items_per_enumerate, flags,
+      handle_out.guest_address());
+
+  if (!handle_out.guest_address()) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto e = make_object<XStaticUntypedEnumerator>(REX_KERNEL_STATE(), items_per_enumerate,
+                                                 item_size);
+
+  // Callers hand the app the region immediately after X_KENUMERATOR as
+  // scratch, so the extra area must actually be allocated.
+  void* extra = nullptr;
+  auto result =
+      e->Initialize(user_index, app_id, open_message, close_message, flags, item_size, &extra);
+  if (XFAILED(result)) {
+    return result;
+  }
+  if (extra && item_size) {
+    std::memset(extra, 0, item_size);
+  }
+
+  // No items are appended: this host has no custom soundtrack. XamEnumerate
+  // reports X_ERROR_NO_MORE_FILES, which is what the guest expects.
+  *handle_out = e->handle();
+  return X_ERROR_SUCCESS;
 }
 
 u32 XamGetPrivateEnumStructureFromHandle_entry(u32 handle, mapped_u32 out_object_ptr) {

@@ -29,6 +29,7 @@ REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DECLARE(bool, fullscreen);
+REXCVAR_DECLARE(bool, start_minimized);
 REXCVAR_DECLARE(int32_t, monitor);
 
 // Display (guest video mode; defined in src/ui/window.cpp)

@@ -1067,16 +1067,21 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
   // Get export resolver for variable import patching
   auto* export_resolver = kernel_state_->emulator()->export_resolver();
 
+
   ImportLibrary library_info;
   library_info.name = base_name;
   library_info.id = library->id;
   library_info.version.value = library->version().value;
   library_info.min_version.value = library->version_min().value;
 
-  // Use a map to properly pair type 0 (variable) and type 1 (thunk) records by ordinal.
-  // Import table entries alternate: type 0 has ordinal info, type 1 has thunk address.
-  // They may not come in immediate succession, so we pair by ordinal.
-  std::unordered_map<uint16_t, ImportLibraryFn> import_map;
+  // Pair type 0 and type 1 import records by ordinal: a type-0 slot with a
+  // matching type-1 thunk is a function import, a lone type-0 a variable.
+  struct ImportRecord {
+    uint32_t value_address = 0;  // type-0 record address
+    uint32_t thunk_address = 0;  // type-1 record address
+    uint32_t raw_value = 0;      // what the type-0 slot held on entry
+  };
+  std::unordered_map<uint16_t, ImportRecord> import_map;
 
   for (uint32_t i = 0; i < library->count; i++) {
     uint32_t record_addr = library->import_table[i];
@@ -1089,38 +1094,16 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
     uint16_t record_type = (record_value & 0xFF000000) >> 24;
     uint16_t ordinal = record_value & 0xFFFF;
 
-    auto& import_info = import_map[ordinal];
-    import_info.ordinal = ordinal;
-
+    auto& record = import_map[ordinal];
     if (record_type == 0) {
-      // Variable import - value_address is where the variable value is stored
-      import_info.value_address = record_addr;
-
-      // Patch variable imports in guest memory with the actual address
-      if (export_resolver) {
-        auto kernel_export = export_resolver->GetExportByOrdinal(base_name, ordinal);
-        if (kernel_export && kernel_export->type == runtime::Export::Type::kVariable) {
-          if (kernel_export->is_implemented() && kernel_export->variable_ptr) {
-            // Write the variable address to guest memory
-            *record_slot = kernel_export->variable_ptr;
-            REXLOG_DEBUG("Patched variable import {}:{:#x} ({}) -> {:#x}", base_name, ordinal,
-                         kernel_export->name, kernel_export->variable_ptr);
-          } else {
-            // write garbage value if we don't have it implemented
-            *record_slot = 0xD000BEEF | (kernel_export->ordinal & 0xFFF) << 16;
-            REXLOG_WARN("Variable import {}:{:#x} ({}) not implemented", base_name, ordinal,
-                        kernel_export->name);
-          }
-        }
-      }
+      record.value_address = record_addr;
+      record.raw_value = record_value;
     } else if (record_type == 1) {
-      // Thunk import - thunk_address is the function pointer location
-      // This is the address we need for function table registration
-      import_info.thunk_address = record_addr;
+      record.thunk_address = record_addr;
     }
   }
 
-  // Convert map to vector (sorted by ordinal for consistent output)
+  // Sorted ordinals, for deterministic output and a stable imports vector.
   std::vector<uint16_t> ordinals;
   ordinals.reserve(import_map.size());
   for (const auto& [ordinal, _] : import_map) {
@@ -1128,13 +1111,81 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
   }
   std::sort(ordinals.begin(), ordinals.end());
 
+  uint32_t variable_total = 0;     // type-0 with no paired thunk
+  uint32_t variable_patched = 0;   // ... resolved to a real variable address
+  uint32_t variable_stubbed = 0;   // ... export exists but is unimplemented
+  uint32_t variable_unpatched = 0; // ... nothing resolved; slot keeps its ordinal
+  uint32_t function_total = 0;     // type-0 paired with a thunk
+
   for (uint16_t ordinal : ordinals) {
-    library_info.imports.push_back(import_map[ordinal]);
+    const auto& record = import_map[ordinal];
+
+    ImportLibraryFn import_info;
+    import_info.ordinal = ordinal;
+    import_info.value_address = record.value_address;
+    import_info.thunk_address = record.thunk_address;
+    library_info.imports.push_back(import_info);
+
+    if (!record.value_address) {
+      // A thunk with no type-0 record. Nothing to patch.
+      continue;
+    }
+    if (record.thunk_address) {
+      // Function import. Its type-0 slot still holds the raw ordinal, which is
+      // only observable if the guest loads the slot and calls through it.
+      ++function_total;
+      continue;
+    }
+
+    ++variable_total;
+    if (!export_resolver) {
+      ++variable_unpatched;
+      continue;
+    }
+
+    auto record_slot = memory()->TranslateVirtual<rex::be<uint32_t>*>(record.value_address);
+    auto kernel_export = export_resolver->GetExportByOrdinal(base_name, ordinal);
+    if (kernel_export && kernel_export->type == runtime::Export::Type::kVariable) {
+      if (kernel_export->is_implemented() && kernel_export->variable_ptr) {
+        *record_slot = kernel_export->variable_ptr;
+        ++variable_patched;
+        REXLOG_DEBUG("Patched variable import {}:{:#x} ({}) -> {:#x}", base_name, ordinal,
+                     kernel_export->name, kernel_export->variable_ptr);
+      } else {
+        // Poison rather than leave the ordinal in place: a fault on 0xD0xxBEEF
+        // names the offending export, a fault on the raw ordinal does not.
+        *record_slot = 0xD000BEEF | (kernel_export->ordinal & 0xFFF) << 16;
+        ++variable_stubbed;
+        REXLOG_WARN("Variable import {}:{:#x} ({}) not implemented", base_name, ordinal,
+                    kernel_export->name);
+      }
+    } else {
+      // The slot keeps its raw ordinal and the guest will dereference it,
+      // entering, for instance, a critical section at a bogus low address.
+      ++variable_unpatched;
+      REXLOG_ERROR(
+          "UNPATCHED variable import {}:{:#x} at guest {:#010X} - slot still holds {:#010X}. {}",
+          base_name, ordinal, record.value_address, record.raw_value,
+          kernel_export ? fmt::format("Export '{}' is registered as a function, not a variable.",
+                                      kernel_export->name)
+                        : "No export is registered for this ordinal.");
+    }
   }
 
   import_libs_.push_back(library_info);
-  REXLOG_DEBUG("created symbols for import library {} with {} imports", base_name,
-               library_info.imports.size());
+
+  // Always emit the tally, at a level that survives --log_level=info. A silent
+  // pass here is what hid the missing kernel_init for months.
+  auto import_summary = fmt::format(
+      "import library {}: {} imports ({} function, {} variable: {} patched, {} stubbed, {} "
+      "unpatched)",
+      base_name, library_info.imports.size(), function_total, variable_total, variable_patched,
+      variable_stubbed, variable_unpatched);
+  if (variable_unpatched) {
+    REXLOG_ERROR("{}", import_summary);
+  } else {
+    REXLOG_INFO("{}", import_summary);
+  }
 
   return true;
 }

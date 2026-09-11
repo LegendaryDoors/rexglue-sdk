@@ -2,7 +2,9 @@
 # Input system and drivers for Xbox 360 controller emulation
 
 add_library(rexinput OBJECT
+    input_playback.cpp
     input_system.cpp
+    input_timeline.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
 )

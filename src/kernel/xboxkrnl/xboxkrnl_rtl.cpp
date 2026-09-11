@@ -23,7 +23,13 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+
+#if !REX_PLATFORM_WIN32
+#include <dlfcn.h>
+#endif
+
 #include <rex/system/kernel_state.h>
+#include <rex/system/stall_dump.h>
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
@@ -398,8 +404,32 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
-    // Create a full waiter.
+    // Create a full waiter. Record what we are blocking on so a stall dump can
+    // print the ownership chain, and report an unaligned pointer at capture.
+    if ((cs.guest_address() & 0x3) != 0 || cs.guest_address() < 0x10000) {
+      // Name the caller: the host return address lands inside the recompiled
+      // guest function, so resolving it gives that function's symbol.
+      void* return_address = __builtin_return_address(0);
+      const char* symbol = "<unresolved>";
+      uintptr_t module_offset = 0;
+#if !REX_PLATFORM_WIN32
+      Dl_info info{};
+      if (dladdr(return_address, &info)) {
+        if (info.dli_sname) {
+          symbol = info.dli_sname;
+        }
+        module_offset = uintptr_t(return_address) - uintptr_t(info.dli_fbase);
+      }
+#endif
+      REXLOG_ERROR(
+          "RtlEnterCriticalSection: implausible cs guest_address={:#010X} lock_count={} "
+          "owning_thread={:#010X} called from {} (+{:#x}) = {}",
+          cs.guest_address(), int32_t(cs->lock_count), uint32_t(cs->owning_thread), return_address,
+          module_offset, symbol);
+    }
+    rex::system::NoteCriticalSectionBlock(cs.guest_address());
     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
+    rex::system::ClearCriticalSectionBlock();
   }
 
   assert_true(cs->owning_thread == 0);

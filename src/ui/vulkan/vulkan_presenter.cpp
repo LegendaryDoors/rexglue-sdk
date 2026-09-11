@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -126,9 +127,6 @@ VulkanPresenter::PaintContext::Submission::~Submission() {
     dfn.vkDestroyCommandPool(device, draw_command_pool_, nullptr);
   }
 
-  if (present_semaphore_ != VK_NULL_HANDLE) {
-    dfn.vkDestroySemaphore(device, present_semaphore_, nullptr);
-  }
   if (acquire_semaphore_ != VK_NULL_HANDLE) {
     dfn.vkDestroySemaphore(device, acquire_semaphore_, nullptr);
   }
@@ -149,13 +147,8 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
         "semaphore");
     return false;
   }
-  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &present_semaphore_) !=
-      VK_SUCCESS) {
-    REXLOG_ERROR(
-        "VulkanPresenter: Failed to create a swapchain image presentation "
-        "semaphore");
-    return false;
-  }
+  // The presentation semaphore is per swapchain image, not per submission -
+  // created alongside the swapchain images.
 
   VkCommandPoolCreateInfo command_pool_create_info;
   command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -758,7 +751,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        paint_context_.swapchain_transfer_src);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -839,7 +833,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        paint_context_.swapchain_transfer_src);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -952,6 +947,27 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     REXLOG_ERROR("VulkanPresenter: Failed to get swapchain images");
     paint_context_.DestroySwapchainAndVulkanSurface();
     return SurfacePaintConnectResult::kFailure;
+  }
+
+  // One presentation semaphore per swapchain image; see
+  // PaintContext::swapchain_present_semaphores for why not per submission.
+  assert_true(paint_context_.swapchain_present_semaphores.empty());
+  {
+    VkSemaphoreCreateInfo present_semaphore_create_info;
+    present_semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    present_semaphore_create_info.pNext = nullptr;
+    present_semaphore_create_info.flags = 0;
+    paint_context_.swapchain_present_semaphores.reserve(paint_context_.swapchain_images.size());
+    for (size_t i = 0; i < paint_context_.swapchain_images.size(); ++i) {
+      VkSemaphore present_semaphore;
+      if (dfn.vkCreateSemaphore(device, &present_semaphore_create_info, nullptr,
+                                &present_semaphore) != VK_SUCCESS) {
+        REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain image presentation semaphore");
+        paint_context_.DestroySwapchainAndVulkanSurface();
+        return SurfacePaintConnectResult::kFailure;
+      }
+      paint_context_.swapchain_present_semaphores.push_back(present_semaphore);
+    }
   }
 
   // Create the image views and the framebuffers.
@@ -1075,8 +1091,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
+    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out,
+    bool& image_transfer_src_out) {
   ui_surface_unusable_out = false;
+  image_transfer_src_out = false;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1299,6 +1317,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.imageExtent = image_extent;
   swapchain_create_info.imageArrayLayers = 1;
   swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  // Reading a presented image back (host output capture) needs the images to
+  // be transfer sources, which a surface is not required to allow.
+  if (surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+    swapchain_create_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    image_transfer_src_out = true;
+  }
   uint32_t swapchain_queue_family_indices[2];
   if (queue_family_index_graphics_compute != queue_family_index_present) {
     // Using concurrent sharing mode to avoid an explicit ownership transfer
@@ -1392,16 +1416,25 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
-  if (swapchain != VK_NULL_HANDLE) {
-    submission_tracker.AwaitAllSubmissionsCompletion();
-  }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  if (swapchain != VK_NULL_HANDLE) {
+    submission_tracker.AwaitAllSubmissionsCompletion();
+    // Presentation is not fence-tracked, so queue operations may still be
+    // outstanding against these images. Idle the device before tearing down.
+    dfn.vkDeviceWaitIdle(device);
+  }
   for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
     dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
   }
   swapchain_framebuffers.clear();
+  // Safe here: AwaitAllSubmissionsCompletion above has drained everything that
+  // could still be waiting on these.
+  for (VkSemaphore semaphore : swapchain_present_semaphores) {
+    dfn.vkDestroySemaphore(device, semaphore, nullptr);
+  }
+  swapchain_present_semaphores.clear();
   swapchain_images.clear();
   swapchain_extent.width = 0;
   swapchain_extent.height = 0;
@@ -1492,6 +1525,211 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   }
 
   return true;
+}
+
+bool VulkanPresenter::CaptureHostOutput(RawImage& image_out) {
+  std::unique_lock<std::mutex> lock(host_capture_mutex_);
+  // One request at a time: a second caller waits for the first to be answered.
+  host_capture_cv_.wait(lock, [this] { return host_capture_image_ == nullptr; });
+  host_capture_image_ = &image_out;
+  host_capture_in_progress_ = false;
+  host_capture_completed_ = false;
+  host_capture_succeeded_ = false;
+  lock.unlock();
+
+  // The UI thread paints only on request, and without a guest output image
+  // (before the game runs) it is the only thread that paints at all.
+  if (!RequestUIThreadPaintFromAnyThread()) {
+    lock.lock();
+    host_capture_image_ = nullptr;
+    lock.unlock();
+    host_capture_cv_.notify_all();
+    REXLOG_WARN("VulkanPresenter: No window to capture the host output from");
+    return false;
+  }
+
+  lock.lock();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!host_capture_completed_) {
+    if (host_capture_in_progress_) {
+      // A paint holds the image and will complete the request; no timeout.
+      host_capture_cv_.wait(lock);
+      continue;
+    }
+    if (host_capture_cv_.wait_until(lock, deadline) == std::cv_status::timeout &&
+        !host_capture_in_progress_ && !host_capture_completed_) {
+      REXLOG_WARN("VulkanPresenter: Nothing was painted within 2 s to capture the host output from");
+      break;
+    }
+  }
+  const bool succeeded = host_capture_completed_ && host_capture_succeeded_;
+  host_capture_image_ = nullptr;
+  host_capture_in_progress_ = false;
+  host_capture_completed_ = false;
+  lock.unlock();
+  host_capture_cv_.notify_all();
+  return succeeded;
+}
+
+void VulkanPresenter::RecordHostCapture(VkCommandBuffer command_buffer, VkImage swapchain_image,
+                                        HostCapturePaint& paint) {
+  {
+    std::lock_guard<std::mutex> lock(host_capture_mutex_);
+    if (!host_capture_image_ || host_capture_in_progress_ || host_capture_completed_) {
+      return;
+    }
+    host_capture_in_progress_ = true;
+  }
+  paint.taken = true;
+  if (!paint_context_.swapchain_transfer_src) {
+    REXLOG_WARN(
+        "VulkanPresenter: The surface does not allow reading its swapchain images back, so the "
+        "host output cannot be captured");
+    return;
+  }
+  paint.extent = paint_context_.swapchain_extent;
+  paint.format = paint_context_.swapchain_render_pass_format;
+  const VkDeviceSize buffer_size =
+      VkDeviceSize(sizeof(uint32_t)) * paint.extent.width * paint.extent.height;
+  if (!util::CreateDedicatedAllocationBuffer(vulkan_device_, buffer_size,
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             util::MemoryPurpose::kReadback, paint.buffer,
+                                             paint.memory)) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the host output capture buffer");
+    paint.buffer = VK_NULL_HANDLE;
+    paint.memory = VK_NULL_HANDLE;
+    return;
+  }
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+
+  // The render pass leaves the image in the present layout; take it out for
+  // the copy and put it back so the present that follows is unaffected.
+  VkImageMemoryBarrier image_memory_barrier;
+  image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  image_memory_barrier.pNext = nullptr;
+  image_memory_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  image_memory_barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  image_memory_barrier.image = swapchain_image;
+  image_memory_barrier.subresourceRange = util::InitializeSubresourceRange();
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                           &image_memory_barrier);
+
+  VkBufferImageCopy buffer_image_copy = {};
+  buffer_image_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  buffer_image_copy.imageSubresource.layerCount = 1;
+  buffer_image_copy.imageExtent.width = paint.extent.width;
+  buffer_image_copy.imageExtent.height = paint.extent.height;
+  buffer_image_copy.imageExtent.depth = 1;
+  dfn.vkCmdCopyImageToBuffer(command_buffer, swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             paint.buffer, 1, &buffer_image_copy);
+
+  // A fence doesn't guarantee host visibility and availability.
+  VkBufferMemoryBarrier buffer_memory_barrier;
+  buffer_memory_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  buffer_memory_barrier.pNext = nullptr;
+  buffer_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  buffer_memory_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  buffer_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  buffer_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  buffer_memory_barrier.buffer = paint.buffer;
+  buffer_memory_barrier.offset = 0;
+  buffer_memory_barrier.size = VK_WHOLE_SIZE;
+  image_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  image_memory_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+  image_memory_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                           nullptr, 1, &buffer_memory_barrier, 1, &image_memory_barrier);
+}
+
+void VulkanPresenter::FinishHostCapture(HostCapturePaint& paint, bool submitted,
+                                        uint64_t submission_index) {
+  if (!paint.taken) {
+    return;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  bool succeeded = false;
+  if (paint.buffer != VK_NULL_HANDLE) {
+    if (submitted) {
+      if (paint_context_.submission_tracker.AwaitSubmissionCompletion(submission_index)) {
+        void* mapping;
+        if (dfn.vkMapMemory(device, paint.memory, 0, VK_WHOLE_SIZE, 0, &mapping) == VK_SUCCESS) {
+          RawImage* image;
+          {
+            std::lock_guard<std::mutex> lock(host_capture_mutex_);
+            image = host_capture_image_;
+          }
+          succeeded = ConvertSwapchainPixelsToRawImage(
+              paint.format, static_cast<const uint32_t*>(mapping), paint.extent, *image);
+          // Unmapping is done by freeing.
+        } else {
+          REXLOG_ERROR("VulkanPresenter: Failed to map the host output capture memory");
+        }
+      } else {
+        REXLOG_ERROR("VulkanPresenter: Failed to await the host output capture submission");
+      }
+    }
+    dfn.vkDestroyBuffer(device, paint.buffer, nullptr);
+    dfn.vkFreeMemory(device, paint.memory, nullptr);
+  }
+  {
+    std::lock_guard<std::mutex> lock(host_capture_mutex_);
+    host_capture_in_progress_ = false;
+    host_capture_completed_ = true;
+    host_capture_succeeded_ = succeeded;
+  }
+  host_capture_cv_.notify_all();
+}
+
+bool VulkanPresenter::ConvertSwapchainPixelsToRawImage(VkFormat format, const uint32_t* pixels,
+                                                        VkExtent2D extent, RawImage& image_out) {
+  const size_t pixel_count = size_t(extent.width) * extent.height;
+  image_out.width = extent.width;
+  image_out.height = extent.height;
+  image_out.stride = sizeof(uint32_t) * extent.width;
+  image_out.data.resize(pixel_count * sizeof(uint32_t));
+  uint32_t* out = reinterpret_cast<uint32_t*>(image_out.data.data());
+  // RawImage is R8 G8 B8 X8 in memory order; the swapchain formats are read as
+  // little-endian words, so R8G8B8A8 is already in that order.
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+      for (size_t i = 0; i < pixel_count; ++i) {
+        out[i] = pixels[i] | 0xFF000000u;
+      }
+      return true;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+      for (size_t i = 0; i < pixel_count; ++i) {
+        const uint32_t bgra = pixels[i];
+        out[i] = ((bgra & 0xFFu) << 16) | (bgra & 0xFF00u) | ((bgra >> 16) & 0xFFu) | 0xFF000000u;
+      }
+      return true;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      for (size_t i = 0; i < pixel_count; ++i) {
+        out[i] = Packed10bpcRGBTo8bpcBytes(pixels[i]);
+      }
+      return true;
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+      for (size_t i = 0; i < pixel_count; ++i) {
+        const uint32_t argb = pixels[i];
+        out[i] = Packed10bpcRGBTo8bpcBytes(((argb & 0x3FFu) << 20) | (argb & 0xFFC00u) |
+                                           ((argb >> 20) & 0x3FFu));
+      }
+      return true;
+    default:
+      REXLOG_ERROR("VulkanPresenter: Host output capture does not handle swapchain format {}",
+                   uint32_t(format));
+      return false;
+  }
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -2119,6 +2357,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
 
+  // A pending host output capture reads this paint's swapchain image back.
+  // The request completes on every exit path once the present is issued.
+  HostCapturePaint host_capture;
+  RecordHostCapture(draw_command_buffer, paint_context_.swapchain_images[swapchain_image_index],
+                    host_capture);
+  struct HostCaptureCompletion {
+    VulkanPresenter& presenter;
+    HostCapturePaint& paint;
+    uint64_t submission_index;
+    bool submitted = false;
+    ~HostCaptureCompletion() { presenter.FinishHostCapture(paint, submitted, submission_index); }
+  } host_capture_completion{*this, host_capture, current_paint_submission_index};
+
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
   VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -2140,7 +2391,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     paint_context_.ui_setup_command_buffer_current_index = SIZE_MAX;
   }
   command_buffers[command_buffer_count++] = draw_command_buffer;
-  VkSemaphore present_semaphore = paint_submission.present_semaphore();
+  // Keyed by the image being presented, not by the frame submission.
+  assert_true(swapchain_image_index < paint_context_.swapchain_present_semaphores.size());
+  VkSemaphore present_semaphore =
+      paint_context_.swapchain_present_semaphores[swapchain_image_index];
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;
@@ -2191,6 +2445,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       // kNotPresented.
       return PaintResult::kNotPresentedConnectionOutdated;
     }
+    host_capture_completion.submitted = true;
   }
 
   VkPresentInfoKHR present_info;

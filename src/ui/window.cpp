@@ -34,6 +34,12 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
 REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(start_minimized, false, "UI/Window",
+                    "Start the window minimized/iconified, for unattended runs. This is a "
+                    "request the window manager may refuse; the '[window] minimized' log line "
+                    "is the ground truth for whether it was honoured.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")

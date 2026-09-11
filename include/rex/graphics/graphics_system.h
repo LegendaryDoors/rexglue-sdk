@@ -70,6 +70,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   RegisterFile* register_file() { return &register_file_; }
   CommandProcessor* command_processor() const { return command_processor_.get(); }
+  uint64_t swap_count() const override;
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) override;
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
@@ -83,9 +84,10 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
-  void RequestFrameTrace();
-  void BeginTracing();
-  void EndTracing();
+  void RequestFrameTrace() override;
+  void BeginTracing() override;
+  void EndTracing() override;
+  bool is_tracing() const override;
 
   bool is_paused() const { return paused_; }
   void Pause();

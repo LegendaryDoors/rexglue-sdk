@@ -10,10 +10,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -28,9 +30,8 @@ class ByteStream;
 
 namespace rex::memory::detail {
 
-/// Compensates for Windows 64KB allocation granularity on the 0xE0 physical heap.
-/// The backing file maps the 0xE0 heap at a 0x1000-byte offset, but MapViewOfFileEx
-/// rounds down to 64KB boundaries. Linux mmap handles 4KB offsets natively.
+/// Compensates for Windows 64KB allocation granularity on the 0xE0 physical
+/// heap: MapViewOfFileEx rounds a 0x1000 offset down, but mmap does not.
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
 #if REX_PLATFORM_WIN32
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
@@ -159,6 +160,10 @@ class BaseHeap {
   uint32_t GetUnreservedPageCount();
 
   uint32_t total_page_count() const { return uint32_t(page_table_.size()); }
+
+  // Guest protection of the page containing the address, kNoAccess when
+  // nothing is allocated there. Reads the page table without the heap mutex.
+  rex::memory::PageAccess QueryPageAccessUnlocked(uint32_t address) const;
   uint32_t unreserved_page_count() const { return unreserved_page_count_; }
   uint32_t reserved_page_count() const { return total_page_count() - unreserved_page_count(); }
 
@@ -289,6 +294,10 @@ class PhysicalHeap : public BaseHeap {
                         bool unwatch_exact_range, bool unprotect = true);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
+
+  // Guest access to the physical page behind one of this view's system pages.
+  // For a page not allocated in this view the parent heap is the authority.
+  rex::memory::PageAccess GuestAccessForSystemPage(uint32_t system_page) const;
 
  protected:
   VirtualHeap* parent_heap_;
@@ -470,6 +479,11 @@ class Memory {
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
       uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect = true);
 
+  // REX_WATCH_MEM=<phys_hex>:<len_hex>, the page-fault half of the diagnostic:
+  // logs first writes per one-second epoch with a host backtrace.
+  void StartWatchMemDiagnostic(uint32_t physical_address, uint32_t length);
+  void StopWatchMemDiagnostic();
+
   // Allocates virtual memory from the 'system' heap.
   // System memory is kept separate from game memory but is still accessible
   // using normal guest virtual addresses. Kernel structures and other internal
@@ -581,6 +595,27 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+
+  static std::pair<uint32_t, uint32_t> WatchMemCallbackThunk(void* context_ptr,
+                                                             uint32_t physical_address_start,
+                                                             uint32_t length, bool exact_range);
+  std::pair<uint32_t, uint32_t> WatchMemCallback(uint32_t physical_address_start, uint32_t length,
+                                                 bool exact_range);
+  void WatchMemThread();
+  uint32_t watch_mem_base_ = 0;
+  uint32_t watch_mem_length_ = 0;
+  void* watch_mem_callback_handle_ = nullptr;
+  std::vector<uint32_t> watch_mem_page_hits_;
+  // One entry per distinct backtrace seen in the current epoch, with the
+  // pages of the watched range that backtrace wrote.
+  struct WatchMemWriter {
+    std::vector<void*> frames;
+    std::vector<uint8_t> pages;
+  };
+  std::vector<WatchMemWriter> watch_mem_writers_;
+  uint32_t watch_mem_writers_dropped_ = 0;
+  std::atomic<bool> watch_mem_stop_{false};
+  std::thread watch_mem_thread_;
 };
 
 }  // namespace rex::memory

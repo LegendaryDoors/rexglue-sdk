@@ -196,8 +196,7 @@ void AudioSystem::Shutdown() {
   shutdown_event_->Set();
   if (worker_thread_) {
     // The worker may be stuck inside a guest callback that is itself blocked
-    // on guest objects (e.g. KeWaitForMultipleObjects).
-    // Terminate the thread to break the deadlock.
+    // on guest objects. Terminate the thread to break the deadlock.
     worker_thread_->Terminate(0);
     worker_thread_.reset();
   }

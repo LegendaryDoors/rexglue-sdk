@@ -182,7 +182,13 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // The same install for a title that is not running, so a launcher can lay
+  // the packages down ahead of time on its own thread.
+  static X_RESULT InstallPackage(const std::filesystem::path& content_root, uint32_t title_id,
+                                 const std::filesystem::path& package_path);
+
  private:
+  X_RESULT InstallContent(const std::filesystem::path& package_path, uint32_t title_id);
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
   std::filesystem::path ResolvePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);

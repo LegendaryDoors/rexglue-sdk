@@ -99,6 +99,11 @@ class Entry {
   virtual bool SetAccessTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   virtual bool SetWriteTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   void SetForDeletion(bool delete_on_close) { delete_on_close_ = delete_on_close; }
+  // Guest handles currently open on this entry. A file marked for deletion is
+  // deleted when the last of them closes, as on NT.
+  uint32_t open_handles() const { return open_handles_; }
+  void AddOpenHandle() { ++open_handles_; }
+  uint32_t ReleaseOpenHandle() { return open_handles_ ? --open_handles_ : 0; }
 
   bool is_read_only() const;
 
@@ -165,6 +170,7 @@ class Entry {
   uint64_t write_timestamp_;
   std::vector<std::unique_ptr<Entry>> children_;
   bool delete_on_close_ = false;
+  uint32_t open_handles_ = 0;
 };
 
 }  // namespace rex::filesystem

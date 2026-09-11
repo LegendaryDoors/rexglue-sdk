@@ -88,6 +88,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void QueueControllerUpdate();
 
   rex::ui::Window* attached_window_ = nullptr;
+  std::atomic<bool> warned_no_window_{false};
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;

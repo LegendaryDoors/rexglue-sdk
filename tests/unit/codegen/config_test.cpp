@@ -321,8 +321,8 @@ TEST_CASE("Config relative path resolution from subdirectory", "[codegen][config
   REQUIRE(cfg.functions.count(0x82240000u) == 1);
   CHECK(cfg.functions.at(0x82240000u).name == "SubFunc");
 
-  // Now test that an included file resolves its OWN includes relative to itself.
-  // Create: top2.toml -> subdir/mid.toml -> ../leaf2.toml (back up to tmp root)
+  // An included file resolves its own includes relative to itself.
+  // top2.toml -> subdir/mid.toml -> ../leaf2.toml, back up to the tmp root.
   WriteTempToml(tmp, "leaf2.toml",
                 "file_path = \"game.xex\"\n"
                 "\n"

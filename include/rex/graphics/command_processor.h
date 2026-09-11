@@ -76,6 +76,7 @@ enum class GammaRampType {
 
 class CommandProcessor {
  public:
+  uint64_t swap_count() const { return swap_count_.load(std::memory_order_relaxed); }
   enum class SwapPostEffect {
     kNone,
     kFxaa,
@@ -94,7 +95,15 @@ class CommandProcessor {
   virtual bool Initialize();
   virtual void Shutdown();
 
+  // Ring pointers, write-back slot and live value, vblank and swap counts.
+  // Logged as a section of every whole-system stall dump; see stall_dump.h.
+  void LogRingState();
+
   void CallInThread(std::function<void()> fn);
+
+  // Downloads register, EDRAM and shared memory state the way the start of a
+  // trace capture does. Must run on the command processor thread.
+  void DebugDownloadTraceState() { InitializeTrace(); }
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -116,9 +125,16 @@ class CommandProcessor {
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
 
+  // Callable from any thread. A stream starts at the next primary buffer and
+  // closes after the next swap, so the last frame in the file is complete.
+  void HashGuestRangeDiagnostic();
   virtual void RequestFrameTrace(const std::filesystem::path& root_path);
   virtual void BeginTracing(const std::filesystem::path& root_path);
   virtual void EndTracing();
+  bool is_streaming_trace() const {
+    TraceState state = trace_state_.load(std::memory_order_relaxed);
+    return state == TraceState::kStreaming || state == TraceState::kStreamEndRequested;
+  }
 
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
 
@@ -181,10 +197,16 @@ class CommandProcessor {
 
   virtual void MakeCoherent();
   virtual void PrepareForWait();
+  // Called periodically while the ring is empty, so work owed to the guest
+  // (results the GPU is still producing) can be completed without blocking.
+  virtual void OnIdleSpin() {}
   virtual void ReturnFromWait();
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // Called before a packet stores a value the guest polls as a GPU fence.
+  // Returning true defers the store until pending resolve results have landed.
+  virtual bool DeferGuestFenceWrite(uint32_t address, uint32_t value) { return false; }
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -255,11 +277,16 @@ class CommandProcessor {
   enum class TraceState {
     kDisabled,
     kStreaming,
+    kStreamEndRequested,
     kSingleFrame,
   };
-  TraceState trace_state_ = TraceState::kDisabled;
+  // Written by whichever thread requests a trace, read by the worker thread.
+  std::atomic<TraceState> trace_state_{TraceState::kDisabled};
   std::filesystem::path trace_stream_path_;
   std::filesystem::path trace_frame_path_;
+  // Worker thread only.
+  std::filesystem::path trace_stream_file_;
+  uint32_t trace_stream_swaps_ = 0;
 
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
@@ -269,7 +296,12 @@ class CommandProcessor {
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
 
+  // Vblank ticks, incremented by GraphicsSystem::MarkVblank. NOT a frame
+  // count: it advances whether or not the guest ever presents.
   uint32_t counter_ = 0;
+  // Actual guest presents (PM4_XE_SWAP). The distinction matters when
+  // diagnosing a hang - a title can tick vblanks forever without presenting.
+  std::atomic<uint32_t> swap_count_{0};
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

@@ -21,6 +21,7 @@
 #include <rex/math.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/graphics/diagnostic_gate.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -432,6 +433,40 @@ VulkanTextureCache::~VulkanTextureCache() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+
+  // REX_DUMP_TEXTURE_BASE write-out - see LoadTextureDataFromResidentMemoryImpl.
+  if (texture_dump_buffer_ != VK_NULL_HANDLE) {
+    const char* texture_dump_path = getenv("REX_DUMP_TEXTURE_PATH");
+    if (!texture_dump_path) {
+      texture_dump_path = "rex_texture_dump.bin";
+    }
+    dfn.vkDeviceWaitIdle(device);
+    void* texture_dump_mapping = nullptr;
+    if (dfn.vkMapMemory(device, texture_dump_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
+                        &texture_dump_mapping) == VK_SUCCESS) {
+      FILE* texture_dump_file = fopen(texture_dump_path, "wb");
+      if (texture_dump_file) {
+        // Header: width, height, row pitch in blocks, bytes per block.
+        fwrite(&texture_dump_width_, sizeof(uint32_t), 1, texture_dump_file);
+        fwrite(&texture_dump_height_, sizeof(uint32_t), 1, texture_dump_file);
+        fwrite(&texture_dump_row_pitch_blocks_, sizeof(uint32_t), 1, texture_dump_file);
+        fwrite(&texture_dump_bytes_per_block_, sizeof(uint32_t), 1, texture_dump_file);
+        fwrite(texture_dump_mapping, 1, size_t(texture_dump_buffer_size_), texture_dump_file);
+        fclose(texture_dump_file);
+        REXGPU_INFO("REX_DUMP_TEXTURE_BASE: wrote {} bytes to {}",
+                    size_t(texture_dump_buffer_size_) + 4 * sizeof(uint32_t), texture_dump_path);
+      } else {
+        REXGPU_ERROR("REX_DUMP_TEXTURE_BASE: cannot open {} for writing", texture_dump_path);
+      }
+      dfn.vkUnmapMemory(device, texture_dump_buffer_memory_);
+    } else {
+      REXGPU_ERROR("REX_DUMP_TEXTURE_BASE: failed to map the readback buffer");
+    }
+    dfn.vkDestroyBuffer(device, texture_dump_buffer_, nullptr);
+    dfn.vkFreeMemory(device, texture_dump_buffer_memory_, nullptr);
+    texture_dump_buffer_ = VK_NULL_HANDLE;
+    texture_dump_buffer_memory_ = VK_NULL_HANDLE;
+  }
 
   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
@@ -1737,6 +1772,77 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
   }
   command_processor_.SubmitBarriers(true);
+
+  // REX_DUMP_TEXTURE_BASE=<hex guest address> also copies the load shader's
+  // converted output to a host-readable buffer, written out on destruction.
+  {
+    // Accepts "<hexbase>" or "<hexbase>/<hexmask>". The masked form matches any
+    // texture whose base agrees under the mask, as allocation moves targets.
+    static const char* texture_dump_base_env = getenv("REX_DUMP_TEXTURE_BASE");
+    static const uint32_t texture_dump_base = [] {
+      if (!texture_dump_base_env) return uint32_t(0);
+      return uint32_t(strtoull(texture_dump_base_env, nullptr, 16));
+    }();
+    static const uint32_t texture_dump_mask = [] {
+      if (!texture_dump_base_env) return ~uint32_t(0);
+      const char* slash = strchr(texture_dump_base_env, '/');
+      return slash ? uint32_t(strtoull(slash + 1, nullptr, 16)) : ~uint32_t(0);
+    }();
+    if (texture_dump_base && ((uint32_t(texture_key.base_page) << 12) & texture_dump_mask) ==
+                                 (texture_dump_base & texture_dump_mask)) {
+      if (texture_dump_buffer_ == VK_NULL_HANDLE) {
+        if (ui::vulkan::util::CreateDedicatedAllocationBuffer(
+                command_processor_.GetVulkanDevice(), host_buffer_size,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
+                texture_dump_buffer_, texture_dump_buffer_memory_)) {
+          texture_dump_buffer_size_ = host_buffer_size;
+        } else {
+          REXGPU_ERROR("REX_DUMP_TEXTURE_BASE: failed to create the readback buffer");
+        }
+      }
+      if (texture_dump_buffer_ != VK_NULL_HANDLE && host_buffer_size <= texture_dump_buffer_size_) {
+        VkBufferCopy texture_dump_copy;
+        texture_dump_copy.srcOffset = 0;
+        texture_dump_copy.dstOffset = 0;
+        texture_dump_copy.size = host_buffer_size;
+        command_buffer.CmdVkCopyBuffer(scratch_buffer, texture_dump_buffer_, 1,
+                                       &texture_dump_copy);
+        command_processor_.PushBufferMemoryBarrier(
+            texture_dump_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        texture_dump_row_pitch_blocks_ = host_layout_base.x_pitch_blocks;
+        texture_dump_bytes_per_block_ = load_shader_info.bytes_per_host_block;
+        texture_dump_width_ = width;
+        texture_dump_height_ = height;
+        REXGPU_INFO(
+            "REX_DUMP_TEXTURE_BASE: captured load of {:08X} ({}x{}, row pitch {} blocks, {} bytes "
+            "per block, {} bytes)",
+            texture_dump_base, width, height, texture_dump_row_pitch_blocks_,
+            texture_dump_bytes_per_block_, host_buffer_size);
+      } else if (texture_dump_buffer_ != VK_NULL_HANDLE) {
+        REXGPU_WARN("REX_DUMP_TEXTURE_BASE: load size {} exceeds the readback buffer ({}), skipped",
+                    host_buffer_size, texture_dump_buffer_size_);
+      }
+    }
+  }
+
+  // Companion of REX_DUMP_TEXTURE_BASE/REX_LOG_DRAWS: whose VkImage each load
+  // fills, so aliased cache entries copying into one another are visible.
+  {
+    static const bool log_loads =
+        getenv("REX_LOG_DRAWS") != nullptr || getenv("REX_DUMP_TEXTURE_BASE") != nullptr ||
+        getenv("REX_LOG_READBACK") != nullptr;
+    if ((log_loads && rex::graphics::diag::LogGateOpen()) ||
+        rex::graphics::diag::LoggedTextureBase() == (uint32_t(texture_key.base_page) << 12)) {
+      REXGPU_INFO(
+          "TEXLOAD base={:08X} mip_base={:08X} {}x{} fmt={} tiled={} scaled={} levels={}..{} "
+          "image={} host_pitch_blocks={}",
+          uint32_t(texture_key.base_page) << 12, uint32_t(texture_key.mip_page) << 12, width,
+          height, uint32_t(texture_key.format), uint32_t(texture_key.tiled),
+          uint32_t(texture_key.scaled_resolve), level_first, level_last,
+          static_cast<void*>(vulkan_texture.image()), host_layout_base.x_pitch_blocks);
+    }
+  }
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       level_last - level_first + 1);
@@ -1823,6 +1929,31 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
         if (uses_signed && host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
           vulkan_binding.image_view_signed = texture->GetView(true, binding->host_swizzle);
         }
+      }
+    }
+    // Companion of TEXLOAD/DRAWLOG: which image and swizzle each fetch
+    // constant actually binds.
+    {
+      static const bool log_bindings =
+          getenv("REX_LOG_DRAWS") != nullptr || getenv("REX_DUMP_TEXTURE_BASE") != nullptr ||
+        getenv("REX_LOG_READBACK") != nullptr;
+      if (log_bindings && rex::graphics::diag::LogGateOpen()) {
+        const Texture* bound_texture = binding->texture;
+        REXGPU_INFO("TEXBIND tf{} base={:08X} {}x{}x{} dim={} fmt={} tiled={} mips=1+{}{} "
+                    "mip_base={:08X} guest_base_bytes={} guest_mips_bytes={} image={} "
+                    "host_swizzle={:03X} signs={:02X}",
+                    binding_index, uint32_t(binding->key.base_page) << 12,
+                    binding->key.GetWidth(), binding->key.GetHeight(),
+                    binding->key.GetDepthOrArraySize(), uint32_t(binding->key.dimension),
+                    uint32_t(binding->key.format), uint32_t(binding->key.tiled),
+                    uint32_t(binding->key.mip_max_level),
+                    binding->key.packed_mips ? " packed" : "", uint32_t(binding->key.mip_page) << 12,
+                    bound_texture ? bound_texture->GetGuestBaseSize() : 0,
+                    bound_texture ? bound_texture->GetGuestMipsSize() : 0,
+                    static_cast<void*>(
+                        bound_texture ? static_cast<const VulkanTexture*>(bound_texture)->image()
+                                      : VK_NULL_HANDLE),
+                    uint32_t(binding->host_swizzle), uint32_t(binding->swizzled_signs));
       }
     }
   }

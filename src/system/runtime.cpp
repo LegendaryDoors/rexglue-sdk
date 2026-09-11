@@ -9,6 +9,8 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -23,7 +25,12 @@
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/screenshot.h>
+#include <rex/system/trace_schedule.h>
+#include <rex/system/script_exit.h>
+#include <rex/system/stall_dump.h>
 #include <rex/system/user_module.h>
+#include <rex/system/xam/content_manager.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
@@ -33,6 +40,12 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
+REXCVAR_DEFINE_STRING(install_content, "", "Runtime",
+                      "An STFS content package, or a directory of them, to install into the user "
+                      "data root for the running title before it starts (DLC, as the files come "
+                      "from a console). Packages already installed are left alone.");
+REXCVAR_DEFINE_BOOL(mount_cache, true, "Runtime",
+                    "Mount cache: (the console cache partition) as a writable host directory");
 
 namespace rex {
 
@@ -135,6 +148,10 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Create kernel state - this sets the global singleton
   kernel_state_ = std::make_unique<system::KernelState>(this);
 
+  // Arm the hang diagnostics here rather than in ReXApp, so an app that builds
+  // its own Runtime still gets them.
+  system::StartStallWatchdog();
+
   // Initialize input from injected config
   if (config.input_factory) {
     input_system_ = config.input_factory(tool_mode_);
@@ -195,6 +212,22 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   } else {
     REXSYS_INFO("Runtime initialized without graphics system (native rendering mode)");
   }
+
+  // Unattended frame capture (--screenshot_at), armed here rather than in
+  // ReXApp so apps that build their own Runtime get it too.
+  system::StartScreenshotScheduler(graphics_system_.get());
+  // Window captures (--screenshot_host_at); a no-op when ReXApp armed them
+  // already, so that apps with their own Runtime get them too.
+  system::StartHostScreenshotScheduler(graphics_system_ ? graphics_system_->presenter()
+                                                        : nullptr);
+
+  // Unattended GPU stream trace (--trace_gpu_stream_at), armed here for the
+  // same reason.
+  system::StartTraceScheduler(graphics_system_.get());
+
+  // Unattended clean exit (--input_script_exit): shut down once the input
+  // script and any scheduled screenshots are done. No-op when false.
+  system::StartScriptExitMonitor(app_context_, display_window_);
 
   REXSYS_INFO("Runtime initialized successfully");
   setup_complete_ = true;
@@ -258,6 +291,16 @@ void Runtime::Shutdown() {
   if (instance_ == this) {
     instance_ = nullptr;
   }
+
+  // The exit monitor waits on the screenshot scheduler's pending flag, so join
+  // it first and it can never read the early stop as captures done.
+  system::StopScriptExitMonitor();
+
+  // The scheduler thread captures from the graphics system; join it before
+  // that system goes away.
+  system::StopScreenshotScheduler();
+  system::StopHostScreenshotScheduler();
+  system::StopTraceScheduler();
 
   if (graphics_system_) {
     graphics_system_->Shutdown();
@@ -344,9 +387,25 @@ bool Runtime::SetupVfs() {
     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
   }
 
-  // NOTE: Do NOT register a device for cache: paths
-  // Games handle "device not found" gracefully but don't handle actual device
-  // errors (like NAME_COLLISION) well. Let cache: fail cleanly.
+  // A console always has a formatted cache partition, so titles use cache:\
+  // unconditionally and every such access fails when nothing is mounted.
+  if (REXCVAR_GET(mount_cache)) {
+    auto cache_dir = user_data_root_ / "cache" / "partition";
+    std::error_code ec;
+    std::filesystem::create_directories(cache_dir, ec);
+    if (ec) {
+      REXSYS_WARN("Runtime::SetupVfs: cannot create {}: {}", cache_dir.string(), ec.message());
+    } else {
+      auto cache_device = std::make_unique<rex::filesystem::HostPathDevice>(
+          "\\CACHE", cache_dir, /*read_only=*/false, /*allow_share_delete=*/true);
+      if (cache_device->Initialize() && file_system_->RegisterDevice(std::move(cache_device))) {
+        file_system_->RegisterSymbolicLink("cache:", "\\CACHE");
+        REXSYS_INFO("  Mounted {} at cache:", cache_dir.string());
+      } else {
+        REXSYS_WARN("Runtime::SetupVfs: failed to register cache: device");
+      }
+    }
+  }
 
   return true;
 }
@@ -363,7 +422,55 @@ X_STATUS Runtime::LoadXexImage(const std::string_view module_path) {
 
   kernel_state_->SetExecutableModule(module);
   REXSYS_DEBUG("  XEX image loaded successfully");
+  InstallContentPackages();
   return X_STATUS_SUCCESS;
+}
+
+void Runtime::InstallContentPackages() {
+  const std::string source = REXCVAR_GET(install_content);
+  if (source.empty()) {
+    return;
+  }
+  auto* content_manager = kernel_state_->content_manager();
+  const uint32_t title_id = kernel_state_->title_id();
+  std::vector<std::filesystem::path> packages;
+  std::error_code ec;
+  if (std::filesystem::is_directory(source, ec)) {
+    // Only the files at the top level: a subdirectory is a set of alternatives
+    // to choose between, not something to install wholesale.
+    for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
+      if (entry.is_regular_file(ec)) {
+        packages.push_back(entry.path());
+      }
+    }
+    std::sort(packages.begin(), packages.end());
+  } else {
+    packages.emplace_back(source);
+  }
+  uint32_t installed = 0, present = 0, failed = 0;
+  for (const auto& package : packages) {
+    system::xam::XCONTENT_AGGREGATE_DATA data;
+    data.content_type = system::XContentType::kMarketplaceContent;
+    data.title_id = title_id;
+    data.xuid = 0;
+    data.set_file_name(rex::path_to_utf8(package.filename()));
+    if (content_manager->ContentExists(0, data)) {
+      ++present;
+      continue;
+    }
+    const X_RESULT result = content_manager->InstallContent(package);
+    if (result == X_ERROR_SUCCESS) {
+      ++installed;
+      REXSYS_INFO("Installed content package '{}' for title {:08X}",
+                  rex::path_to_utf8(package.filename()), title_id);
+    } else {
+      ++failed;
+      REXSYS_ERROR("Content package '{}' could not be installed: {:08X}", package.string(),
+                   result);
+    }
+  }
+  REXSYS_INFO("--install_content '{}': {} installed, {} already present, {} failed", source,
+              installed, present, failed);
 }
 
 system::object_ref<system::XThread> Runtime::PrepareModuleLaunch() {
