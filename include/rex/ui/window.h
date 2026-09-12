@@ -14,8 +14,10 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <rex/platform.h>
 #include <rex/ui/menu_item.h>
@@ -349,7 +351,28 @@ class Window {
     }
   }
 
+  // DIAGNOSTIC. One key or mouse event to hand the listeners as if the
+  // platform had reported it, for tests that must press what a person would
+  // press. Coordinates are physical pixels.
+  struct InjectedInput {
+    enum class Kind { kKeyDown, kKeyUp, kMouseMove, kMouseDown, kMouseUp };
+    Kind kind = Kind::kKeyDown;
+    VirtualKey key = VirtualKey::kNone;
+    MouseEvent::Button button = MouseEvent::Button::kLeft;
+    int32_t x = 0;
+    int32_t y = 0;
+  };
+  // Queued rather than delivered here: input that arrives in the middle of a
+  // frame cannot carry a press through hover, active and release the way a
+  // platform event does, because the frame's transitions are settled before
+  // any of it is drawn.
+  void QueueInjectedInput(const InjectedInput& input);
+
  protected:
+  // Hands the listeners everything queued by QueueInjectedInput. Call between
+  // frames, before painting.
+  void DeliverInjectedInput();
+
   // The receiver, which must never be instantiated in the Window object itself
   // (rather, usually it should be created as a local variable, because only
   // LIFO-ordered creation and deletion of these is supported), that allows
@@ -599,6 +622,9 @@ class Window {
   void OnTouchEvent(TouchEvent& e, WindowDestructionReceiver& destruction_receiver);
 
  private:
+  std::mutex injected_input_mutex_;
+  std::vector<InjectedInput> injected_input_;
+
   struct ListenerIterationContext {
     explicit ListenerIterationContext(ListenerIterationContext* outer_context,
                                       size_t first_index = 0)

@@ -360,6 +360,7 @@ void WindowSDL::RequestPaintImpl() {
 
 void WindowSDL::HandlePaintEvent() {
   paint_pending_.store(false, std::memory_order_release);
+  DeliverInjectedInput();
   OnPaint();
 }
 

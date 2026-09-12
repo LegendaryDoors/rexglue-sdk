@@ -612,6 +612,60 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
   }
 }
 
+void Window::QueueInjectedInput(const InjectedInput& input) {
+  {
+    std::lock_guard<std::mutex> lock(injected_input_mutex_);
+    injected_input_.push_back(input);
+  }
+  // A platform event is followed by a repaint; the queued one needs that frame
+  // too, so the press it starts can be carried through.
+  RequestPaint();
+}
+
+void Window::DeliverInjectedInput() {
+  std::vector<InjectedInput> inputs;
+  {
+    std::lock_guard<std::mutex> lock(injected_input_mutex_);
+    if (injected_input_.empty()) {
+      return;
+    }
+    inputs.swap(injected_input_);
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  for (const InjectedInput& input : inputs) {
+    switch (input.kind) {
+      case InjectedInput::Kind::kKeyDown:
+      case InjectedInput::Kind::kKeyUp: {
+        KeyEvent e(this, input.key, 1, false, false, false, false, false);
+        if (input.kind == InjectedInput::Kind::kKeyDown) {
+          OnKeyDown(e, destruction_receiver);
+        } else {
+          OnKeyUp(e, destruction_receiver);
+        }
+        break;
+      }
+      case InjectedInput::Kind::kMouseMove: {
+        MouseEvent e(this, MouseEvent::Button::kNone, input.x, input.y);
+        OnMouseMove(e, destruction_receiver);
+        break;
+      }
+      case InjectedInput::Kind::kMouseDown:
+      case InjectedInput::Kind::kMouseUp: {
+        MouseEvent e(this, input.button, input.x, input.y);
+        if (input.kind == InjectedInput::Kind::kMouseDown) {
+          OnMouseDown(e, destruction_receiver);
+        } else {
+          OnMouseUp(e, destruction_receiver);
+        }
+        break;
+      }
+    }
+    if (destruction_receiver.IsWindowDestroyed()) {
+      return;
+    }
+  }
+}
+
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
