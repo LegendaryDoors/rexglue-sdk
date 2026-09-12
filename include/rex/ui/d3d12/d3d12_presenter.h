@@ -12,7 +12,9 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include <rex/math.h>
@@ -86,6 +88,8 @@ class D3D12Presenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+
+  bool CaptureHostOutput(RawImage& image_out) override;
 
   void AwaitUISubmissionCompletionFromUIThread(UINT64 submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -311,6 +315,26 @@ class D3D12Presenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+
+  // One host output capture in flight, answered by the next paint: the back
+  // buffer is copied to a readback buffer before it goes to the present state.
+  struct HostCapturePaint {
+    bool taken = false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  void RecordHostCapture(ID3D12GraphicsCommandList* command_list, ID3D12Resource* back_buffer,
+                         HostCapturePaint& paint);
+  void FinishHostCapture(HostCapturePaint& paint, bool submitted, UINT64 submission_index);
+
+  std::mutex host_capture_mutex_;
+  std::condition_variable host_capture_cv_;
+  RawImage* host_capture_image_ = nullptr;
+  bool host_capture_in_progress_ = false;
+  bool host_capture_completed_ = false;
+  bool host_capture_succeeded_ = false;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

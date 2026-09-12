@@ -10,9 +10,12 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include <rex/assert.h>
@@ -552,6 +555,156 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   swap_chain_allows_tearing = false;
   swap_chain_height = 0;
   swap_chain_width = 0;
+}
+
+bool D3D12Presenter::CaptureHostOutput(RawImage& image_out) {
+  std::unique_lock<std::mutex> lock(host_capture_mutex_);
+  // One request at a time: a second caller waits for the first to be answered.
+  host_capture_cv_.wait(lock, [this] { return host_capture_image_ == nullptr; });
+  host_capture_image_ = &image_out;
+  host_capture_in_progress_ = false;
+  host_capture_completed_ = false;
+  host_capture_succeeded_ = false;
+  lock.unlock();
+
+  // The UI thread paints only on request, and without a guest output image
+  // (before the game runs) it is the only thread that paints at all.
+  if (!RequestUIThreadPaintFromAnyThread()) {
+    lock.lock();
+    host_capture_image_ = nullptr;
+    lock.unlock();
+    host_capture_cv_.notify_all();
+    REXLOG_WARN("D3D12Presenter: No window to capture the host output from");
+    return false;
+  }
+
+  lock.lock();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!host_capture_completed_) {
+    if (host_capture_in_progress_) {
+      // A paint holds the image and will complete the request; no timeout.
+      host_capture_cv_.wait(lock);
+      continue;
+    }
+    if (host_capture_cv_.wait_until(lock, deadline) == std::cv_status::timeout &&
+        !host_capture_in_progress_ && !host_capture_completed_) {
+      REXLOG_WARN("D3D12Presenter: Nothing was painted within 2 s to capture the host output from");
+      break;
+    }
+  }
+  const bool succeeded = host_capture_completed_ && host_capture_succeeded_;
+  host_capture_image_ = nullptr;
+  host_capture_in_progress_ = false;
+  host_capture_completed_ = false;
+  lock.unlock();
+  host_capture_cv_.notify_all();
+  return succeeded;
+}
+
+void D3D12Presenter::RecordHostCapture(ID3D12GraphicsCommandList* command_list,
+                                       ID3D12Resource* back_buffer, HostCapturePaint& paint) {
+  {
+    std::lock_guard<std::mutex> lock(host_capture_mutex_);
+    if (!host_capture_image_ || host_capture_in_progress_ || host_capture_completed_) {
+      return;
+    }
+    host_capture_in_progress_ = true;
+  }
+  paint.taken = true;
+
+  ID3D12Device* device = provider_.GetDevice();
+  const D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
+  UINT64 buffer_size;
+  device->GetCopyableFootprints(&back_buffer_desc, 0, 1, 0, &paint.footprint, nullptr, nullptr,
+                                &buffer_size);
+  paint.width = uint32_t(back_buffer_desc.Width);
+  paint.height = back_buffer_desc.Height;
+
+  D3D12_RESOURCE_DESC buffer_desc;
+  util::FillBufferResourceDesc(buffer_desc, buffer_size, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(&util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE,
+                                             &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&paint.buffer)))) {
+    REXLOG_ERROR("D3D12Presenter: Failed to create the host output capture buffer");
+    paint.buffer.Reset();
+    return;
+  }
+
+  // The back buffer is a render target here; it is put back before the barrier
+  // to the present state that follows this copy.
+  D3D12_RESOURCE_BARRIER barrier;
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+  barrier.Transition.pResource = back_buffer;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  command_list->ResourceBarrier(1, &barrier);
+
+  D3D12_TEXTURE_COPY_LOCATION copy_dest;
+  copy_dest.pResource = paint.buffer.Get();
+  copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  copy_dest.PlacedFootprint = paint.footprint;
+  D3D12_TEXTURE_COPY_LOCATION copy_source;
+  copy_source.pResource = back_buffer;
+  copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_source.SubresourceIndex = 0;
+  command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, nullptr);
+
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  command_list->ResourceBarrier(1, &barrier);
+}
+
+void D3D12Presenter::FinishHostCapture(HostCapturePaint& paint, bool submitted,
+                                       UINT64 submission_index) {
+  if (!paint.taken) {
+    return;
+  }
+  bool succeeded = false;
+  if (paint.buffer && submitted &&
+      paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(submission_index)) {
+    void* mapping;
+    const D3D12_RANGE read_range = {0, SIZE_T(paint.footprint.Footprint.RowPitch) * paint.height};
+    if (SUCCEEDED(paint.buffer->Map(0, &read_range, &mapping))) {
+      RawImage* image;
+      {
+        std::lock_guard<std::mutex> lock(host_capture_mutex_);
+        image = host_capture_image_;
+      }
+      if (image) {
+        image->width = paint.width;
+        image->height = paint.height;
+        image->stride = sizeof(uint32_t) * size_t(paint.width);
+        image->data.resize(image->stride * paint.height);
+        // The swapchain is B8G8R8A8; RawImage is R8 G8 B8 X8 in memory order.
+        for (uint32_t y = 0; y < paint.height; ++y) {
+          const uint32_t* source = reinterpret_cast<const uint32_t*>(
+              static_cast<const uint8_t*>(mapping) +
+              size_t(paint.footprint.Footprint.RowPitch) * y);
+          uint32_t* destination =
+              reinterpret_cast<uint32_t*>(image->data.data() + image->stride * y);
+          for (uint32_t x = 0; x < paint.width; ++x) {
+            const uint32_t bgra = source[x];
+            destination[x] =
+                ((bgra & 0xFFu) << 16) | (bgra & 0xFF00u) | ((bgra >> 16) & 0xFFu) | 0xFF000000u;
+          }
+        }
+        succeeded = true;
+      }
+      const D3D12_RANGE written_range = {};
+      paint.buffer->Unmap(0, &written_range);
+    } else {
+      REXLOG_ERROR("D3D12Presenter: Failed to map the host output capture buffer");
+    }
+  }
+  paint.buffer.Reset();
+  {
+    std::lock_guard<std::mutex> lock(host_capture_mutex_);
+    host_capture_in_progress_ = false;
+    host_capture_completed_ = true;
+    host_capture_succeeded_ = succeeded;
+  }
+  host_capture_cv_.notify_all();
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -1129,6 +1282,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ExecuteUIDrawersFromUIThread(ui_draw_context);
   }
 
+  // A pending host output capture reads the back buffer as it is about to be
+  // presented, overlays included.
+  HostCapturePaint host_capture;
+  RecordHostCapture(command_list, back_buffer, host_capture);
+
   // End drawing to the back buffer.
   D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
   barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1147,6 +1305,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ui_submission_tracker_.NextSubmission();
   }
   paint_context_.paint_submission_tracker.NextSubmission();
+  FinishHostCapture(host_capture, true, current_paint_submission);
   // Present as soon as possible, without waiting for vsync (the host refresh
   // rate may be something like 144 Hz, which is not a multiple of the common
   // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
